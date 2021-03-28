@@ -11,7 +11,7 @@ load_dotenv()
 
 intents = discord.Intents.all()
 intents.members = True
-command_prefix = "%InfinityTrades "
+command_prefix = "%InfinityTrades"
 bot = Bot(command_prefix=command_prefix, intents=intents, help_command=None)
 
 state = os.environ.get('state')
