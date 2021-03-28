@@ -119,7 +119,7 @@ async def on_member_join(member):
     print("Recognised that a member called " + member.name + " joined")
     try: 
         embed = discord.Embed(title=f'', 
-        description=f'Welcome to **InfinityTrades** @{member.name}, enjoy your stay here!\n\nLook around and let us know if you have any questions!\n\nFeel free to also visit our website that explains all the features we offer https://infinitytrades.wordpress.com/', colour=discord.Colour.gold())
+        description=f'Welcome to **InfinityTrades** {member.mention}, enjoy your stay here!\n\nLook around and let us know if you have any questions!\n\nFeel free to also visit our website that explains all the features we offer https://infinitytrades.wordpress.com/', colour=discord.Colour.gold())
         embed.set_thumbnail(url='https://cdn.discordapp.com/avatars/825152063775965215/3819a7dc11f547fadb770c5fc167c37d.png')
         await member.send(embed=embed)
         print("Sent message to " + member.name)
