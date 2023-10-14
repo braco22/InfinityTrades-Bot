@@ -1,0 +1,728 @@
+{$UNDEF SCRIPT_ID}{$DEFINE SCRIPT_ID := ''}
+{$UNDEF SCRIPT_REVISION}{$DEFINE SCRIPT_REVISION := ''}
+{$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+
+type
+  Background = (
+    WASP,
+    RANDOMBG,
+    SABER,
+    CHIKA,
+    HAYASAKA,
+    SHINOBU,
+    MEGUMIN,
+    AYAKA,
+    BRIDGET,
+    MIKASA,
+    MIKO
+  );
+
+begin
+  Login.PlayerIndex := 0;
+  WLSettings.Antiban.Chat := False;
+  WLSettings.Antiban.GameTabs := False;
+  WLSettings.Antiban.Bank := False;
+  WLSettings.Antiban.Camera := False;
+end;
+
+var
+  TURBO                                  = False;
+
+  LAMP_SKILL: ERSSKILL                   = ERSSKILL.SLAYER;
+
+  //you can put a discord webhook url below I WILL NOT HELP YOU SET THIS UP
+  //https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks
+  WEBHOOKURL: String                     = '';
+  WEBHOOKDISCID: String                  = '';// enter your disc ID to get @'d when sending webhooks
+
+  PROGRESSBACKGROUND: Background         = RANDOMBG;
+//==============================================================================
+type
+  EState = (
+    NULL_STATE,
+
+    MINE_ROCK,
+    DROP_ITEMS,
+    HOP_WORLDS,
+    CLICK_GENIE,
+    HANDLE_CHAT,
+    HANDLE_LAMP,
+    CLICK_LAMP,
+    HANDLE_LEVELUP
+  );
+
+  IronMiner = record(TBaseBankScript)
+    State: EState;
+    Position: TPoint;
+
+    RockCoords: TPointArray;
+    CurrentRock: Int32;
+
+    ItemsToDrop: TRSItemArray;
+  end;
+var
+PRSPACING, PRTOP, TITLEOFFSET, TITLECOLOR, FOOTERCOLOR: Int32;
+BGOFFSET: Int32 = 0;
+REDTEXT = True;
+DARKSHADOW = TRUE;
+PlayerToCloseTick: Int32 = 14;
+const
+RELD_WELCOME_SENTENCES: TStringArray = [
+    'Join WaspScripts today!',
+    'Road to max cape with',
+    'No time to play legit?',
+    'What are you waiting for?',
+    'The best public color bots',
+    'Learn how to script at',
+    'Get that 99 with',
+    'Daily bans are not normal,',
+    'Everything is open source',
+    'Imagine AHK on steroids',
+    'Unleash the power of Simba'
+  ];
+
+procedure TAntiban.Setup(); override;
+begin
+  Self.Skills := [ERSSkill.TOTAL, ERSSkill.MINING];
+  Self.MinZoom := 70;
+  Self.MaxZoom := 100;
+
+  inherited;
+end;
+
+procedure IronMiner.SendWebhook(msg: String; FilePath: String = '');
+var
+  HTTP: Int32;
+begin
+  if WEBHOOKURL = "" then
+    Exit();
+  if WEBHOOKDISCID then
+    msg := ' <@' + WEBHOOKDISCID + '>' + LineEnding + msg;
+  HTTP := InitializeHTTPClient(False);
+  AddPostVariable(HTTP, 'content', msg);
+  try
+    PostHTTPPageEx(HTTP, WEBHOOKURL);
+    if filePath then
+      PostHTTPForm(HTTP, WEBHOOKURL, 'Attachments', FilePath);
+  finally
+    FreeHTTPClient(HTTP);
+  end;
+end;
+
+function TRSInventory.ReallyQuickShiftDrop(Slots: TIntegerArray): Boolean;
+var
+  I: Int32;
+  Circle: TCircle;
+  Boxes: TBoxArray;
+  Order, Pattern: TIntegerArray;
+  miss: Double;
+begin
+  Pattern := Inventory.RandomPattern();
+
+  miss := Mouse.MissChance;
+  Mouse.MissChance := 0;
+  for I := 0 to High(Pattern) do
+    if Pattern[I] in Slots then
+      Order += Pattern[I];
+
+
+  IsKeyDown(VK_SHIFT); // Clear cache
+  KeyUp(VK_SHIFT);
+
+  Boxes := Self.GetSlotBoxes;
+
+  try
+    if not IsKeyDown(VK_SHIFT) then
+    begin
+      KeyDown(VK_SHIFT);
+      Wait(50,100,wdLeft); // Fix provided by Slacky <3
+    end;
+    for i:=0 to high(Order) do
+    begin
+      if Self.IsSlotUsed(Order[I]) then
+      begin
+        Mouse.Move(Self.GetSlotBox(Order[I]));
+        Mouse.Click(MOUSE_LEFT);
+        WaitEx(25,5);
+        if not TURBO then
+          Wait(45);
+      end;
+    end;
+  finally
+    if IsKeyDown(VK_SHIFT) then
+      KeyUp(VK_SHIFT);
+  end;
+
+  KeyUp(VK_SHIFT);
+  Mouse.MissChance := miss;
+end;
+
+procedure IronMiner.DropItems();
+var
+  slots: TIntegerArray;
+  files: TStringArray;
+begin
+  if Inventory.FindItems(Self.ItemsToDrop, slots) then
+    Inventory.ReallyQuickShiftDrop(slots);
+end;
+
+procedure IronMiner.HandleGenie();
+var
+  TPA: TPointArray;
+  uptext: String;
+begin
+  Wait(2000,4000);
+  SRL.FindColors(TPA, CTS2(15697954, 18, 0.04, 0.58),Mainscreen.GetPlayerBox.Expand(80));
+  Mouse.Move(TPA.RandomValue());
+  uptext := Mainscreen.GetUpText();
+  if uptext.Contains('Genie') then
+    begin
+      Mouse.Click(MOUSE_LEFT);
+      WaitUntil(Chat.HasContinue(), 200, 2000);
+    end;
+end;
+
+procedure IronMiner.HandleLamp();
+var
+  skill: TPoint;
+  submit: TPoint = [260,277];
+begin
+  case LAMP_SKILL of
+    ERSSKILL.ATTACK: skill := [187,133];
+    ERSSKILL.STRENGTH: skill := [222,133];
+    ERSSKILL.RANGE: skill := [256,133];
+    ERSSKILL.MAGIC: skill := [294,133];
+    ERSSKILL.DEFENCE: skill := [330,133];
+
+    ERSSKILL.HITPOINTS: skill := [167, 169];
+    ERSSKILL.PRAYER: skill := [203,169];
+    ERSSKILL.AGILITY: skill := [239,169];
+    ERSSKILL.HERBLORE: skill := [275,169];
+    ERSSKILL.THIEVING: skill := [311,169];
+    ERSSKILL.CRAFTING: skill := [347,169];
+
+    ERSSKILL.RUNECRAFTING: skill := [167,204];
+    ERSSKILL.SLAYER: skill := [203,204];
+    ERSSKILL.FARMING: skill := [239,204];
+    ERSSKILL.MINING: skill := [275,204];
+    ERSSKILL.SMITHING: skill := [311,204];
+    ERSSKILL.FISHING: skill := [347,204];
+
+
+    ERSSKILL.COOKING: skill := [167,240];
+    ERSSKILL.FIREMAKING: skill := [203,240];
+    ERSSKILL.WOODCUTTING: skill := [239,240];
+    ERSSKILL.FLETCHING: skill := [275,240];
+    ERSSKILL.CONSTRUCTION: skill := [311,240];
+    ERSSKILL.HUNTER: skill := [347,240];
+  end;
+
+  Mouse.click(Box(skill,5,5), MOUSE_LEFT);
+  Wait(200,300);
+
+  Mouse.click(Box(submit,35,5), MOUSE_LEFT);
+  Wait(500,1000);
+end;
+
+procedure IronMiner.Mine();
+var
+  slots: TIntegerArray;
+begin
+  if RSObjects.IronRock.Click() then
+  begin
+    Self.TotalActions += 1;
+    Self.CurrentRock  := Self.CurrentRock + 1;
+    if Self.CurrentRock = (High(Self.RockCoords) + 1) then
+      Self.CurrentRock := 0;
+    RSObjects.IronRock.Coordinates := [Self.RockCoords[Self.CurrentRock]];
+
+    Mouse.move(RSW.GetTileMS(RSObjects.IronRock.Coordinates[0],1,0,0).Expand(-5));
+
+    XPBar.WaitXP(6000);
+
+    if not TURBO then
+      Wait(120, 310);
+  end;
+end;
+
+procedure TMufasaBitmap.DrawTextOutline(text: String; p: TPoint; color: Int32; darkShadow: Boolean = True; size: Int32 = 1);
+var
+  shadowColor, i: Int32;
+
+begin
+  if darkShadow then shadowColor := 1
+  else shadowColor := $FFFFFF;
+  for i := 1 to size do                                        //why am i so fuzy :(
+  begin
+    Self.DrawText(text, [p.X + i, p.Y + i], shadowColor);
+    Self.DrawText(text, [p.X + i, p.Y - i], shadowColor);
+    Self.DrawText(text, [p.X - i, p.Y + i], shadowColor);
+    Self.DrawText(text, [p.X - i, p.Y - i], shadowColor);
+
+    Self.DrawText(text, [p.X + i, p.Y], shadowColor);
+    Self.DrawText(text, [p.X, p.Y + i], shadowColor);
+    Self.DrawText(text, [p.X - i, p.Y], shadowColor);
+    Self.DrawText(text, [p.X, p.Y - i], shadowColor);
+  end;
+  Self.DrawText(text, p, color);
+end;
+
+procedure ProgressReport.DrawBackground(strArray: TStringArray; fontColor: Int32); static; override;
+begin
+  if not ProgressReport.IsSetup then
+  begin
+    if strArray = [] then
+      Exit;
+
+    ProgressReport.BGImg.setFontSize(26);
+    ProgressReport.BGImg.DrawTextOutline(ScriptName.Before('.simba').Replace('_', ' ').Capitalize(), [Round(ProgressReport.BGImg.GetWidth()/2) + 10, Round(Mainscreen.Bounds.Y1) + BGOFFSET + TITLEOFFSET], TITLECOLOR, True, 2);
+
+    ProgressReport.BGImg.setFontSize(22);
+
+    if WLSettings.RemoteInput.HUDTransparent then
+      ProgressReport.BGImg.DrawTextOutline(strArray[High(strArray)], [-5, 130 + BGOFFSET], FOOTERCOLOR, True, 2)
+    else
+      ProgressReport.BGImg.DrawTextOutline(strArray[High(strArray)], [-5, 130 + BGOFFSET], FOOTERCOLOR, True, 2);
+    ProgressReport.IsSetup := True;
+  end;
+
+  ProgressReport.ClientImg.DrawBitmap(ProgressReport.BGImg, ProgressReport.TopLeft.Offset(0, -BGOFFSET));
+end;
+
+procedure ProgressReport.DrawProgress(strArray: TStringArray; fontColor: Int32); static; override;
+var
+  p, q: TPoint;
+  i: Int32;
+begin
+  p := [ProgressReport.TopLeft.X + 10, ProgressReport.TopLeft.Y + PRTOP + 6];
+  if WLSettings.RemoteInput.HUDTransparent then
+    p.Y -= 12;
+  q := [Round(Chat.Bounds().Width()/2) + 20, p.Y];
+  if REDTEXT then
+    fontColor -= $C8D100;
+
+  for i := 0 to High(strArray) - 1 do
+  begin
+    if Frac(i/2) = 0 then
+    begin
+      ClientImg.DrawTextOutline(strArray[i], p, fontColor, DARKSHADOW, 2);
+      p.Y += PRSPACING + 4;
+    end
+    else
+    begin
+      ClientImg.DrawTextOutline(strArray[i], q, fontColor, DARKSHADOW, 2);
+      q.Y += PRSPACING + 4;
+    end;
+  end;
+
+  ProgressReport.PreviousStrArray := strArray;
+  if WLSettings.RemoteInput.HUDTransparent then
+    ProgressReport.ClientImg.DrawBoxFilled(ProgressReport.UsernameBox, False, $819DAC);
+end;
+
+function TBaseScript.BuildTextReport(): TStringArray; override;
+var
+  elapsedTime: UInt64;
+begin
+  if Self.Action = Self.PreviousAction then
+      Exit;
+
+  Self.DebugLn(Self.Action, Self.ExtraInfo);  //add action and extra info the the log.
+  elapsedTime := Self.TimeRunning.ElapsedTime();
+
+  Result += ' Action: ' + Self.Action;
+
+  Result += ' Runtime: ' + SRL.MsToTime(elapsedTime, Time_Short).Trim();
+
+
+  Result += ' Ores Mined   : ' + ToStr(Self.TotalActions);
+  if Self.ActionLimit > -1 then
+    Result[High(Result)] += '/' + ToStr(Self.ActionLimit);
+
+  Result += ' Ores/Hour  : ' + ToStr(NumberPerHour(Self.TotalActions, elapsedTime));
+
+  Result += ' Total Exp    : ' + SRL.FormatNumber(WL.XP.Previous - WL.XP.Start, 1);
+  Result += ' Exp/Hour   : ' + SRL.FormatNumber(NumberPerHour(WL.XP.Previous - WL.XP.Start, elapsedTime), 1);
+
+  Result += ' Total Profit : ' + SRL.FormatNumber(Self.TotalProfit, 1);
+  Result += ' Profit/Hour: ' + SRL.FormatNumber(NumberPerHour(Self.TotalProfit, elapsedTime), 2);
+
+  Result += ' ' + Self.Welcome + ' waspscripts.com';
+end;
+
+procedure OnStartAntibanTaskEvent(Task: PAntibanTask);
+var
+  str: String;
+begin
+  if Length(ProgressReport.ProgressArray) < 1 then
+    Exit;
+
+  str := ' Action: Antiban';
+  ProgressReport.ProgressArray[0] := str;
+  str := ' Runtime: ' + SRL.MsToTime(ProgressReport.PTimeRunning^.ElapsedTime, Time_Short).Trim();
+  ProgressReport.ProgressArray[1] := str;
+
+  {$IFNDEF SRL_DISABLE_REMOTEINPUT}
+  if WLSettings.RemoteInput.Enabled and WLSettings.RemoteInput.HUDReport and not WLSettings.RemoteInput.HUDDebug then
+    ProgressReport.Update(ProgressReport.ProgressArray);
+  {$ENDIF}
+end;
+
+procedure OnBreakingTaskEvent(Task: PBreakTask; var countdown: TCountdown);
+var
+  str: String;
+begin
+  if Length(ProgressReport.ProgressArray) < 1 then
+    Exit;
+
+  str := ' Breaking: ' + SRL.MsToTime(countdown.TimeRemaining(), Time_Short).Trim();
+  ProgressReport.ProgressArray[0] := str;
+  str := ' Runtime: ' + SRL.MsToTime(ProgressReport.PTimeRunning^.ElapsedTime, Time_Short).Trim();
+  ProgressReport.ProgressArray[1] := str;
+
+  {$IFNDEF SRL_DISABLE_REMOTEINPUT}
+  if WLSettings.RemoteInput.Enabled and WLSettings.RemoteInput.HUDReport and not WLSettings.RemoteInput.HUDDebug then
+    ProgressReport.Update(ProgressReport.ProgressArray);
+  {$ENDIF}
+end;
+
+procedure OnFinishBreakTaskEvent(Task: PBreakTask);
+begin
+  PlayerToCloseTick := 14;
+end;
+
+procedure OnFinishSleepTaskEvent(Task: PSleepTask);
+begin
+  PlayerToCloseTick := 14;
+end;
+
+procedure IronMiner.Init(maxActions: Int32; maxTime: Int64); override;
+var
+  HTTP, randomInt: Int32;
+  imageName, url: String;
+begin
+  inherited;
+
+  Antiban.OnStartTask := @OnStartAntibanTaskEvent;
+  Antiban.OnBreaking := @OnBreakingTaskEvent;
+
+  Antiban.OnFinishBreak := @OnFinishBreakTaskEvent;
+  Antiban.OnFinishSleep := @OnFinishSleepTaskEvent;
+
+  Self.Welcome := RELD_WELCOME_SENTENCES.RandomValue();
+
+  if PROGRESSBACKGROUND = RANDOMBG then
+  begin
+    randomInt := Random(1,9);
+    case randomInt of
+      0: PROGRESSBACKGROUND := WASP;
+      1: PROGRESSBACKGROUND := SABER;
+      2: PROGRESSBACKGROUND := CHIKA;
+      3: PROGRESSBACKGROUND := HAYASAKA;
+      4: PROGRESSBACKGROUND := SHINOBU;
+      5: PROGRESSBACKGROUND := MEGUMIN;
+      6: PROGRESSBACKGROUND := AYAKA;
+      7: PROGRESSBACKGROUND := BRIDGET;
+      8: PROGRESSBACKGROUND := MIKASA;
+      9: PROGRESSBACKGROUND := MIKO;
+    end;
+  end;
+
+  ProgressReport.ClientImg.setFontSize(20);
+  PRTOP := 30;
+  ProgressReport.TextColor := $FFFFFF;
+  FOOTERCOLOR := $006CFF;
+  TITLECOLOR := $FFFFFF;
+  PRSPACING := 20;
+
+  if PROGRESSBACKGROUND <> WASP then
+  begin
+
+    Case PROGRESSBACKGROUND of
+      SABER:
+      begin
+        FOOTERCOLOR := $FFFFFF;
+        imageName := 'Saber';
+        url := 'https://i.imgur.com/SahoWLR.png';
+      end;
+      CHIKA:
+      begin
+        ProgressReport.TextColor := 1;
+        FOOTERCOLOR := $006CFF;
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        DARKSHADOW := False;
+        TITLEOFFSET := -11;
+        imageName := 'Chika';
+        url := 'https://i.imgur.com/envZEzT.png';
+      end;
+      HAYASAKA:
+      begin
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        TITLEOFFSET := -11;
+        imageName := 'Hayasaka';
+        url := 'https://i.imgur.com/0jLX4wF.png';
+      end;
+      SHINOBU:
+      begin
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        TITLEOFFSET := -11;
+        imageName := 'Shinobu';
+        url := 'https://i.imgur.com/S4E0Hoj.png';
+      end;
+      MEGUMIN:
+      begin
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        TITLEOFFSET := -11;
+        imageName := 'Megumin';
+        url := 'https://i.imgur.com/0yUICUl.png';
+      end;
+      AYAKA:
+      begin
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        TITLEOFFSET := -11;
+        imageName := 'Ayaka';
+        url := 'https://i.imgur.com/OgJ79H5.png';
+      end;
+      BRIDGET:
+      begin
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        TITLEOFFSET := -11;
+        imageName := 'Bridget';
+        url := 'https://i.imgur.com/shXZeGC.png';
+      end;
+      MIKASA:
+      begin
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        TITLEOFFSET := -11;
+        imageName := 'Mikasa';
+        url := 'https://i.imgur.com/a9p3iyi.png';
+      end;
+      MIKO:
+      begin
+        ProgressReport.TextColor := 1;
+        FOOTERCOLOR := $006CFF;
+        BGOFFSET := 100;
+        PRTOP := 25;
+        REDTEXT := False;
+        DARKSHADOW := False;
+        TITLEOFFSET := -11;
+        imageName := 'Miko';
+        url := 'https://i.imgur.com/DII2t0L.png';
+      end;
+    end;
+    if not DirectoryExists(AppPath + '\Resources\') then
+      CreateDirectory(AppPath + '\Resources');
+    if not FileExists(AppPath + '\Resources\ReldBGImage' + imageName + '.png') then
+      begin
+        Writeln('Downloading super based stat overlay....');
+        HTTP := InitializeHTTPClient(False);
+        try
+          GetHTTPPageEx(HTTP, url, AppPath + '\Resources\ReldBGImage' + imageName + '.png');
+
+        finally
+          FreeHTTPClient(HTTP);
+        end;
+      end;
+      ProgressReport.BGImg.LoadFromFile(AppPath + '\Resources\ReldBGImage' + imageName + '.png');
+    end;
+    RSW.Setup([RSREGIONS.MINING_GUILD]);
+    Self.Position := RSW.GetMyPos();
+
+    if Self.Position.DistanceTo([6418,616]) < 5 then
+      Self.RockCoords := [[6414,616],[6418,612],[6418,620]]
+    else if Self.Position.DistanceTo([6452,620]) < 5 then
+      Self.RockCoords := [[6448,620],[6452,616],[6456,620]];
+
+    Self.CurrentRock := random(0,High(Self.RockCoords));
+    RSObjects.IronRock.Coordinates := [Self.RockCoords[Self.CurrentRock]];
+    RSObjects.IronRock.UpText := ['Mine I'];
+    if TURBO then
+      Mouse.Speed := 35;
+
+    Self.ItemsToDrop := [
+    'Iron ore', 'Clue geode (beginner)', 'Clue geode (easy)', 'Clue geode (medium)', 'Uncut sapphire',
+    'Clue geode (hard)', 'Clue geode (elite)','Uncut emerald','Uncut ruby','Uncut diamond'
+  ];
+end;
+
+function IronMiner.GetState(): EState;
+var
+  player, npc: TPoint;
+  tpa,ftpa: TPointArray;
+  c: TCuboid;
+begin
+
+  for player in Minimap.GetDots(ERSMinimapDot.PLAYER) do
+  begin
+    if player.WithinDistance(Minimap.center, 10) then
+    begin
+      PlayerToCloseTick += 5;
+      if (PlayerToCloseTick >= 15) then
+        Exit(HOP_WORLDS);
+    end
+    else
+    begin
+      PlayerToCloseTick -= 1;
+      if PlayerToCloseTick < 0 then
+        PlayerToCloseTick := 0;
+    end;
+  end;
+
+  if Chat.LeveledUp() then
+    Exit(HANDLE_LEVELUP);
+
+  if Chat.HasContinue then
+    Exit(HANDLE_CHAT);
+
+  if SRL.CountColor(CTS2(7566460, 10, 0.24, 0.10), Mainscreen.Bounds()) >= 90000 then
+    Exit(HANDLE_LAMP);
+
+  if Inventory.ContainsItem('Lamp') then
+    Exit(CLICK_LAMP);
+
+  if Inventory.IsFull() then
+    Exit(DROP_ITEMS);
+
+  npc := Minimap.GetDotInCircle(ERSMinimapDot.NPC, Minimap.Center, 2);
+  if npc <> [0,0] then
+  begin
+    c := Minimap.GetCuboidMS(npc, [1, 1, 7], [-3 , -1]);
+    SRL.FindColors(tpa, CTS2(15697954, 18, 0.04, 0.58), Mainscreen.GetPlayerBox.Expand(80));
+    ftpa := c.Filter(tpa);
+
+    if ftpa.Len() > 10 then
+      Exit(CLICK_GENIE);
+  end;
+
+  Exit(MINE_ROCK);
+end;
+
+
+procedure IronMiner.Run(maxActions: Int32; maxTime: Int64);
+begin
+
+  try
+  Self.Init(maxActions, maxTime);
+    repeat
+      Self.State := Self.GetState();
+      Self.SetAction(ToStr(Self.State));
+
+      case State of
+        DROP_ITEMS: Self.DropItems();
+        MINE_ROCK: Self.Mine();
+        CLICK_GENIE: Self.HandleGenie();
+        HANDLE_CHAT: Chat.ClickContinue();
+        HANDLE_LAMP: Self.HandleLamp();
+        CLICK_LAMP:
+        begin
+          Inventory.ClickItem('Lamp', 'Rub');
+          WaitUntil(SRL.CountColor(CTS2(7566460, 10, 0.24, 0.10), Mainscreen.Bounds()) >= 90000, 300, 3000);
+        end;
+        HOP_WORLDS:
+        begin
+          WorldHopper.Hop(Login.GetPlayer.Worlds);
+          PlayerToCloseTick := 14;
+        end;
+        HANDLE_LEVELUP:
+        begin
+          Self.SendWebhook('Increased mining level', SaveScreenshot('levelup', Chat.Bounds()));
+          Chat.HandleLevelUp();
+        end;
+      end;
+
+    Self.DoAntiban();
+    until Self.ShouldStop();
+  except
+      Self.SendWebHook('Iron Miner has terminated unexpectedly' +
+                        LineEnding + GetExceptionMessage());
+      RaiseException(GetExceptionMessage());
+  end;
+  if Self.ShouldStop() then
+    Self.SendWebHook('Iron Miner has terminated successfully');
+end;
+
+var
+  Script: IronMiner;
+
+{$IFDEF SCRIPT_GUI}
+type
+  TConfig = record(TScriptForm)
+    BackgroundSelector: TLabeledCombobox;
+    TurboCheckBox: TLabeledCheckBox;
+  end;
+
+procedure TConfig.StartScript(sender: TObject); override;
+begin
+  PROGRESSBACKGROUND := Background(Self.BackgroundSelector.GetItemIndex());
+  TURBO := Self.TurboCheckBox.IsChecked();
+  inherited;
+end;
+
+procedure TConfig.Run(); override;
+var
+  tab: TTabSheet;
+begin
+  Self.Setup("New Script");
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  Self.CreateAccountManager(tab);
+
+  Self.CreateVersionPanel(tab);
+
+  Self.CreateAntibanManager();
+
+  Self.CreateWaspLibSettings();
+  Self.CreateAPISettings();
+
+  with Self.TurboCheckBox do
+  begin
+    Create(tab);
+    SetCaption("Turbo mode WARNING: higher risk");
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(200));
+    SetChecked(TURBO);
+  end;
+
+  with Self.BackgroundSelector do
+  begin
+    Create(tab);
+    SetCaption("Overlay Background:");
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(300));
+    SetStyle(csDropDownList);
+    AddItemArray(['Wasp', 'Random', 'Saber', 'Chika', 'Hayasaka', 'Shinobu', 'Megumin', 'Ayaka', 'Bridget', 'Mikasa', 'Miko Iino']);
+    SetItemIndex(Ord(PROGRESSBACKGROUND));
+  end;
+
+  inherited;
+end;
+
+var
+  Config: TConfig;
+{$ENDIF}
+
+begin
+  {$IFDEF SCRIPT_GUI}
+  Sync(@Config.Run);
+  {$ENDIF}
+  Script.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.
