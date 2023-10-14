@@ -1,0 +1,731 @@
+{$UNDEF SCRIPT_REVISION}{$DEFINE SCRIPT_REVISION := '1'}
+program PrushAmethyst;
+{$DEFINE SRL_USE_REMOTEINPUT}
+{$DEFINE FORMS_V2}
+{$I SRL-T/OSR.simba}
+{$I WaspLib/osr.simba}
+
+Const
+(* Script settings *)
+
+  PERCSHIFT  = 14;     // Percent pixelshift to be considered 'chopping'
+  MAXRUNTIME = 10000;   // Max run time in minutes
+
+Type
+  EState = (
+  LOGIN_PLAYER,
+  DO_ANTIBAN,
+  WALK_BANK,
+  WALK_SPOT,
+  MINE_ROCKS,
+  USE_SPEC,
+  EMPTY_GEM_BAG,
+  DEPOSIT_ROCKS
+  );
+
+  TScript = record (TBaseBankScript)
+    State                       : EState;
+
+    BankTile,
+    SpotTile: TPoint;
+
+    RockCol : TCTS2Color;
+
+    BankChest: TRSObject;
+
+    Amethyst,
+    GemBag: TRSItem;
+
+    MiscItems: TRSItemArray;
+
+    ABTimeMod,
+    Inventories,
+    Count,
+    Price,
+    StartXP,
+    MineCycles : Int32;
+
+    TakeBreaks,
+    TakeSleeps: Boolean;
+    ShutDownTime: Int64;
+    TrueRunTime: TStopWatch;
+
+end;
+
+Var
+  Bot: TScript;
+  GUI: TScriptForm;
+
+procedure TScript.WriteMsg(Message: String);
+begin
+  WriteLn('[Bot]: ', Message);
+end;
+
+procedure TScriptForm.StartScript(Sender: TObject); override;
+var
+  S: TObject;
+  MaxRun: Int32;
+  e_Run,e_BA,e_BF,e_SA,e_SF: TEdit;
+  cb_Breaks,cb_Sleeps: TCheckBox;
+  Loc,Mine,Mode: TComboBox;
+begin
+  inherited;
+
+  Self.Form.Close();
+  Bot.WriteMsg('Starting script');
+
+{ Time settings }
+  e_Run            := Self.Form.GetChild('box_run_edit');
+  MaxRun           := StrToInt(e_Run.getText);
+  Bot.ShutdownTime := (MaxRun * 60000) + Random(- (MaxRun * 6000), (MaxRun * 6000));
+
+  cb_Breaks        := Self.Form.GetChild('cb_breaks_checkbox');
+  Bot.TakeBreaks   := cb_Breaks.IsChecked;
+  if Bot.TakeBreaks then
+  begin
+    e_BA           := Self.Form.GetChild('box_ba_edit');
+    e_BF           := Self.Form.GetChild('box_bf_edit');
+    Antiban.AddBreak(ONE_MINUTE*StrToInt(e_BA.getText),ONE_MINUTE*StrToInt(e_BF.getText), 0.15, 1.0);
+  end;
+
+  cb_Sleeps        := Self.Form.GetChild('cb_sleeps_checkbox');
+  Bot.TakeSleeps   := cb_Sleeps.IsChecked;
+  if Bot.TakeSleeps then
+  begin
+    e_SA           := Self.Form.GetChild('box_sa_edit');
+    e_SF           := Self.Form.GetChild('box_sf_edit');
+    Antiban.AddSleep(e_SA.getText, StrToInt(e_SF.getText) * ONE_HOUR, 0.1, 1.0);
+  end;
+
+{ Script settings }
+  Loc  := Self.Form.GetChild('lcb_loc_combobox');
+  Mine := Self.Form.GetChild('lcb_mine_combobox');
+  Mode := Self.Form.GetChild('lcb_mode_combobox');
+
+
+  S := Sender;
+end;
+
+function TScriptForm.CreateSettingsTab(): TTabSheet;
+  type TScriptForm = TScriptForm;
+  procedure TScriptForm.UpdateSList(Sender: TObject);
+  var
+    S,Loc,Mine,Mode: TComboBox;
+  begin
+    S := Sender;
+
+
+
+    if Loc.getItemIndex = 0 then // Mining Guild
+    begin
+      Mine.AddItem('Amethyst', S);
+      Mode.AddItem('Bank', S);
+    end;
+
+    Mine.setItemIndex(0);
+    Mode.setItemIndex(0);
+  end;
+
+var
+  lb_Time: TLabel;
+  cb_Breaks,cb_Sleeps  : TLabeledCheckBox;
+  box_Run,box_BA,box_BF,
+  box_SA,box_SF: TLabeledEdit;
+
+begin
+  Result.Init(nil);
+  Result.SetCaption('Script settings');
+  Result.SetName('Settings_Tab');
+
+{ Setup time settings }
+  with lb_Time do
+  begin
+    Create(Result);
+    SetLeft(125);
+    SetTop(10);
+    SetFontColor($00FFFF);
+    GetFont().SetSize(15);
+    SetCaption('Time Settings');
+  end;
+
+
+  with box_Run do
+  begin
+    Create(Result);
+    SetLeft(562);
+    SetTop(310);
+    SetName('box_Run');
+    SetCaption('Run for');
+    SetToolTip('Time in minutes');
+    SetText('300');
+    SetFontColor($00FFFF);
+  end;
+
+  with cb_Breaks do
+  begin
+    Create(Result);
+    SetLeft(5);
+    SetTop(55);
+    SetName('cb_breaks');
+    SetCaption('Take breaks');
+    SetFontColor($00FFFF);
+  end;
+
+  with box_BA do
+  begin
+    Create(Result);
+    SetLeft(5);
+    SetTop(75);
+    SetName('box_ba');
+    SetCaption('Break after');
+    SetToolTip('Time in minutes');
+    SetText('60');
+    SetFontColor($00FFFF);
+  end;
+
+  with box_BF do
+  begin
+    Create(Result);
+    SetLeft(5);
+    SetTop(125);
+    SetName('box_bf');
+    SetCaption('Break for');
+    SetToolTip('Time in minutes');
+    SetText('15');
+    SetFontColor($00FFFF);
+  end;
+
+  with cb_Sleeps do
+  begin
+    Create(Result);
+    SetLeft(200);
+    SetTop(55);
+    SetName('cb_sleeps');
+    SetCaption('Take sleeps');
+    SetFontColor($00FFFF);
+  end;
+
+  with box_SA do
+  begin
+    Create(Result);
+    SetLeft(200);
+    SetTop(75);
+    SetName('box_sa');
+    SetCaption('Sleep at');
+    SetToolTip('Time in 24Hr format');
+    SetText('11:00:00');
+    SetFontColor($00FFFF);
+  end;
+
+  with box_SF do
+  begin
+    Create(Result);
+    SetLeft(200);
+    SetTop(125);
+    SetName('box_sf');
+    SetCaption('Sleep for');
+    SetToolTip('Time in hours');
+    SetText('2');
+    SetFontColor($00FFFF);
+  end;
+
+
+end;
+
+procedure TScriptForm.Setup(caption: String = 'Script Form'; size: TPoint = [750, 500]; allowResize: Boolean = False); override;
+var
+  Img: TPicture;
+  BGImg: TImage;
+  SButton: TButton;
+begin
+  inherited;
+
+  Img.init();
+  Img.LoadFromFile('Resources\PRUSHAMETHYST.png');
+  with BGImg do
+  begin
+    Init(Self.PageControl);
+    SetParent(Self.PageControl);
+    SetBounds(0,0,Self.Form.getWidth,Self.Form.getHeight);
+    SetPicture(Img);
+  end;
+
+  Self.Start.setVisible(False);
+  with SButton do
+  begin
+    Create(Self.Form);
+    SetBounds(Self.Form.GetRight-190, Self.Form.GetBottom-70, 180, 60);
+    GetFont.SetName('Bahnschrift');
+    GetFont.SetSize(15);
+    SetCaption('Run');
+    SetOnClick(@Self.StartScript);
+  end;
+
+  Self.AddTab(CreateSettingsTab());
+  Self.CreateVersionPanel(Self.Tabs[0]);
+  Self.CreateAPISettings();
+  Self.CreateAccountManager();
+end;
+
+
+// by Rasta Magician, veteran SRL-er
+function ProgReport(
+                           ResultType:int32; ScriptName, ScriptAuthor, ScriptVersion: String;
+                           VarNames: TStringArray;
+                           VarValues: TVariantArray
+                          ): Variant;
+var
+  TSA        : TStringArray;
+  s,s2       : String;
+  s3         : String := '=';
+  s4         : String := ' ';
+  i, i2, L   : Int32;
+begin
+  if (ResultType = 2) then
+    Result := '';
+
+  if length(VarNames) <> Length(VarValues) then
+  begin
+    Writeln('VarNames and VarValues must be the same length');
+    exit;
+  end;
+  SetLength(TSA, 3 + Length(VarNames) + 4);
+  s2 := 'by '+ScriptAuthor;
+
+  TSA[0] := s3;
+  TSA[1] := ScriptName.Capitalize+' '+ScriptVersion;
+  TSA[2] := s2;
+  TSA[3] := s3;
+
+  i2 := 3 + Length(VarNames);
+
+  for i:= 4 to i2 do
+    L := Max(L, Length(VarNames[i-4]));
+
+  for i:= 4 to i2 do
+  begin
+    s := VarValues[i-4];
+    TSA[i] := Padr((VarNames[i-4]).Capitalize, L)+' : '+ s.Capitalize;
+  end;
+
+  TSA[i2+1] := s3;
+  TSA[i2+2] := ScriptName.Capitalize+' '+ScriptVersion;
+  TSA[i2+3] := s3;
+
+  i2 := 0;
+  for i:= 0 to High(TSA) do
+    i2 := Max(i2, Length(TSA[i]));
+
+  TSA[0]           := s3.Replicate(i2);
+  TSA[3]           := s3.Replicate(i2);
+  TSA[High(TSA)-2] := s3.Replicate(i2);
+  TSA[High(TSA)]   := s3.Replicate(i2);
+
+  TSA[2] := s4.Replicate(round((i2 - Length(TSA[2]))/2)) + TSA[2]; //centering by ScriptAuthor
+  TSA[High(TSA)-1] := s4.Replicate(round((i2 - Length(TSA[High(TSA)-1]))/2)) + TSA[High(TSA)-1];
+
+  for i:= 0 to High(TSA) do
+    if (TSA[i][1] = s3) then
+      case ResultType of
+        0 : writeln     ('[='+Padr(TSA[i], i2)+'=]');
+        1 : writeln     ('[='+Padr(TSA[i], i2)+'=]');
+        2 : Result := Result + '[='+Padr(TSA[i], i2)+'=]' + chr(13);
+        else begin Writeln('Invalid Result Type'); exit; end;
+      end
+    else
+      case ResultType of
+        0 : writeln     ('[ '+Padr(TSA[i], i2)+' ]');
+        1 : writeln     ('[ '+Padr(TSA[i], i2)+' ]');
+        2 : Result := Result + '[ '+Padr(TSA[i], i2)+' ]' + chr(13);
+        else begin Writeln('Invalid Result Type'); exit; end;
+      end;
+
+  if not ResultType = 2 then Result := true;
+end;
+
+
+// Undo the bogged down version in WaspLib
+function TRSChooseOption.Select(Text: TStringArray; MouseAction: Int32 = MOUSE_LEFT; CaseSensitive: Boolean = True; CloseIfNotFound: Boolean = True): Boolean; override;
+var
+  Choices: TRSChooseOption_OptionArray;
+  I, J: Int32;
+begin
+  if Self.Open() then
+  begin
+    Wait(0, 750, wdLeft);
+
+    Choices := GetOptions();
+
+    for I := 0 to High(Choices) do
+      for J := 0 to High(Text) do
+        if (CaseSensitive and (Text[J] in Choices[I].Text)) or ((not CaseSensitive) and (Lowercase(Text[J]) in Lowercase(Choices[I].Text))) then
+        begin
+          Self.Select(Choices[I], MouseAction);
+          Exit(True);
+        end;
+
+    if CloseIfNotFound then
+    begin
+      WaitEx(400, 150);
+
+      Self.Close();
+    end;
+  end;
+end;
+{ Import SRL-F snippets }
+
+function TRSBank.DepositRandomItem(Item: TRSBankDepositItem; UseQuantityButtons: Boolean): Boolean;
+var
+  Slots: TIntegerArray;
+begin
+  if Inventory.FindItem(Item.Item, Slots) then
+    if Slots.Len > 1 then
+      Result := Self.DepositHelper(Inventory.GetSlotBox(SRL.TruncatedGauss(Slots[0],Slots[Length(Slots)-1])), Item.Quantity, UseQuantityButtons)
+    else
+      Result := Self.DepositHelper(Inventory.GetSlotBox(Slots[0]), Item.Quantity, UseQuantityButtons);
+end;
+
+procedure TScript.DoLoseFocus();
+Var T: Int32;
+begin
+  T := SRL.NormalRange(1700,8000);
+  Antiban.DebugLn('Losing focus for '+SRL.MsToTime(T, Time_Short));
+  Antiban.LoseFocus(T);
+end;
+
+procedure TScript.HandleAntiban();
+begin
+  if GetTimeRunning() > Self.ShutdownTime then
+    TerminateScript('Time to shutdown');
+  Self.TrueRunTime.Pause();
+  Antiban.DoAntiban();
+  Self.TrueRunTime.Resume();
+  Self.MineCycles := 0;
+end;
+
+procedure TScript.SetupAntiban();
+begin
+  Antiban.Skills += [ERSSKILL.MINING, ERSSKILL.TOTAL];
+  Antiban.AddTask((ONE_MINUTE*4)*Self.ABTimeMod,  @Self.DoLoseFocus);;
+end;
+
+procedure TScript.Init(MaxActions: Int32; MaxTime: Int64); override;
+Var
+  MyPos: TPoint;
+  z: Int32;
+begin
+
+    if (not RSClient.IsLoggedIn) then
+    if Login.GetPlayer.Password <> '' then
+      Login.LoginPlayer
+    else
+    begin
+      Self.WriteMsg('No player credentials');
+      Exit;
+    end;
+
+    z := Options.GetZoomLevel();
+  if (not InRange(z, 0, 5)) then
+    Options.SetZoomLevel(SRL.TruncatedGauss(0,5))
+  else
+    MM2MS.ZoomLevel := z;
+
+  Self.SetupAntiban();
+  ABTimeMod := 3;
+  Self.RSW.Setup([RSRegions.MINING_GUILD]);
+  Self.RSW.AdaptiveWalk := True;
+  MyPos := Self.RSW.GetMyPos();
+  Mouse.Speed := Random(17, 21);
+  Mouse.Distribution := MOUSE_DISTRIBUTION_GAUSS;
+  Self.MineCycles := 0;
+  RockCol := CTS2(8481444, 16, 0.21, 0.68);
+
+  BankTile := [6391, 626];
+  SpotTile := [6408, 688];
+
+  GemBag := 'Open gem bag';
+
+  StartXP := XPBar.Read();
+
+  Amethyst := 'Amethyst';
+  Price := ItemData.GetAverage('Amethyst');
+  MiscItems := ['Uncut sapphire', 'Uncut emerald', 'Uncut ruby', 'Uncut diamond', 'Unidentified minerals'];
+
+  BankChest.Setup(3, [[6382, 628]]);
+  BankChest.Setup(['Bank chest']);
+  BankChest.Finder.Colors += CTS2(3948624, 18, 0.25, 0.66);
+
+
+  Self.ShutdownTime := (MAXRUNTIME * 60000) + Random(- (MAXRUNTIME * 6000), (MAXRUNTIME * 6000));
+end;
+
+function TScript.AvailableOre(): TPointArray;
+var
+  TPA: TPointArray;
+  ATPA: T2DPointArray;
+  Finder: TRSObjectFinder;
+begin
+  Finder.Colors += RockCol;
+  Finder.Grow := 4;
+  Finder.ClusterDistance := 4;
+
+  ATPA := MainScreen.FindObject(Finder);
+  if ATPA.Len < 1 then Exit;
+  for TPA in ATPA do
+    Result += TPA.Mean();
+
+  Result.Sort([MainScreen.GetPlayerBox.Middle.X, MainScreen.GetPlayerBox.Y2]);
+end;
+
+procedure TScript.MineRocks();
+var
+  i, CurrentXP: Int32;
+  T: TCountDown;
+  Rocks: TPointArray;
+begin
+  if Bank.IsOpen then
+  begin
+    Bank.Close();
+    Exit;
+  end;
+
+  if RSW.GetMyPos().DistanceTo(SpotTile) >= 40 then
+  begin
+    RSW.WebWalk(SpotTile);
+    Exit;
+  end;
+
+  Rocks := Self.AvailableOre();
+
+  for i := 0 to Min(3, High(Rocks)) do
+  begin
+    Mouse.Move(Rocks[i]);
+    if MainScreen.IsUpText('Amethyst crystals', 75) then
+      break;
+  end;
+
+  Mouse.Click(MOUSE_LEFT);
+  if not MainScreen.DidRedClick then
+    Exit;
+
+
+
+  CurrentXP := XPBar.Read();
+
+  WaitUntil(XPBar.Read() > CurrentXP, 200, SRL.TruncatedGauss(40000, 53500));
+  Wait(900);
+  Exit;
+
+  T.Init(SRL.NormalRange(2700, 3100));
+  while not T.isFinished do
+  begin
+    if not RSClient.IsLoggedIn then
+      Exit;
+    if Inventory.IsFull() then
+      break;
+
+    if Chat.ClickContinue(False) then
+      T.Restart;
+
+    if XPBar.Read() > CurrentXP then
+    begin
+      CurrentXP := XPBar.Read();
+      T.Restart();
+    end;
+
+    for i := 1 to 2 do
+      if (SRL.PercentShift(MainScreen.GetPlayerBox(), 500) >= PERCSHIFT) then
+      begin
+        T.Restart();
+        break;
+      end;
+
+    if SRL.Dice(45) then
+      if Antiban.DoAntiban then
+        T.Restart();
+
+    WaitEx(150, 20);
+  end;
+
+  Wait(130, 850);
+  if SRL.Dice(15) then
+    case SRL.Dice(50) of
+      True:  Minimap.SetCompassAngle(Minimap.GetCompassAngle() - Random(20, 70));
+      False: Minimap.SetCompassAngle(Minimap.GetCompassAngle() + Random(20, 70));
+    end;
+
+  if SRL.Dice(20) then
+    case SRL.Dice(50) of
+      True: Self.DoLoseFocus();
+      False: Self.Report();
+    end;
+end;
+
+
+procedure TScript.DepositRocks();
+begin
+  Self.Inventories += 1;
+  Self.MineCycles += 1;
+  if (not RSClient.IsLoggedIn) then
+    Exit;
+
+  if (not Bank.IsOpen()) then
+    if (RSW.GetMyPos.DistanceTo(BankTile) >= 15) then
+    begin
+      Minimap.EnableRun();
+      RSW.WebWalk(BankTile);
+      Exit;
+    end;
+
+  Inc(Count, Inventory.CountItem(Amethyst));
+  BankChest.Hover();
+  if Mainscreen.IsUpText(['Bank chest']) then
+  begin
+    BankChest.WalkClick();
+    WaitUntil(Bank.IsOpen(), 175, 3150);
+  end;
+
+  if Bank.IsOpen() then
+  begin
+    Self.DepositItem(Amethyst, True);
+    WaitUntil(not Inventory.ContainsItem(Amethyst), 175, 3100);
+    Self.DepositItems(MiscItems);
+    WaitUntil(not Inventory.ContainsAny(MiscItems), 175, 3100);
+    Bank.Close();
+    if (not WaitUntil((not Bank.IsOpen()), 75, 3200)) then
+      Bank.Close();
+    Wait(175, 350);
+  end;
+
+  if Self.Inventories = 10 then
+  begin
+    if not Inventory.ClickItem(GemBag, 'Empty') then
+      Exit;
+
+    Wait(randomRange(1850, 3150));
+    Self.Inventories := 0;
+
+    if Bank.IsOpen() then
+    begin
+      Bank.Close();
+      WaitUntil(not Bank.IsOpen(), 185, 2150);
+    end;
+  end;
+  ClearDebug();
+  Self.Report();
+end;
+
+
+procedure TScript.doAction();
+begin
+  Self.State := Self.getState();
+
+  // Debugging statement to print the current state
+  //WriteLn('Current state: ', Self.State);
+
+  case Self.State of
+    EState.LOGIN_PLAYER: if not Login.LoginPlayer() then Exit;
+    EState.MINE_ROCKS: Self.MineRocks();
+    EState.USE_SPEC:
+      begin
+        Minimap.EnableSpec(100);
+        Wait(randomRange(1150, 2350));
+      end;
+    EState.DEPOSIT_ROCKS: Self.DepositRocks();
+    EState.DO_ANTIBAN: Self.HandleAntiban();
+  end;
+end;
+
+procedure TScript.Run(MaxActions: Int32; MaxTime: Int64);
+begin
+  Self.Init(MaxActions, MaxTime);
+  repeat
+    if not RSClient.IsLoggedIn() then
+      if not Login.LoginPlayer() then
+        Break;
+    self.doAction();
+  until (GetTimeRunning() > Self.ShutdownTime);
+
+  WriteLn 'Done';
+end;
+
+function FormatRoundedNumber(Number: Integer): String;
+begin
+  // If the number is >= 1 million, format it with 1 decimal place and add "M" suffix
+  if Number >= 1000000 then
+    Result := FormatFloat('0.0M', Number / 1000000)
+  // If the number is >= 1 thousand, format it with no decimal places and add "K" suffix
+  else if Number >= 1000 then
+    Result := FormatFloat('0K', Number / 1000)
+  // For smaller numbers, use the regular SRL.FormatNumber function
+  else
+    Result := SRL.FormatNumber(Number);
+end;
+
+procedure TScript.Report();
+Var
+  XPNow := XPBar.Read();
+  Totalprofit: Int32 := (Price * Count);
+begin
+  WriteLn('||===========================||');
+  WriteLn('||~ - ~ Prush Sandstorm ~ - ~||');
+  WriteLn('||===========================||');
+  WriteLn(padR('|| Runtime: ' + SRL.MsToTime(GetTimeRunning, Time_Short), 29, ' ') + '||');
+  WriteLn(padR('|| XP Gained: ' + FormatRoundedNumber(XPNow - StartXP), 29, ' ') + '||');
+  WriteLn(padR('|| Total Profit: ' + FormatRoundedNumber(TotalProfit), 29, ' ') + '||');
+  WriteLn(padR('|| Amethyst: ' + FormatRoundedNumber(Count), 29, ' ') + '||');
+  WriteLn('||===========================||');
+  WriteLn(padR('|| Amethyst/Hr: ' + FormatRoundedNumber(Round((Count) / (GetTimeRunning() / 3600000))), 29, ' ') + '||');
+  WriteLn(padR('|| XP/Hr: ' + FormatRoundedNumber(Round((XPNow - StartXP) / (GetTimeRunning() / 3600000))), 29, ' ') + '||');
+  WriteLn(padR('|| Profit/Hr: ' + FormatRoundedNumber(Round((TotalProfit) / (GetTimeRunning() / 3600000))), 29, ' ') + '||');
+  WriteLn('||===========================||');
+  WriteLn('||-=-= ~ Prush Scripts ~ =-=-||');
+  WriteLn('||===========================||');
+end;
+
+
+
+function TScript.GetState(): EState;
+begin
+  if (not RSClient.IsLoggedIn) then Exit;
+
+  if Self.MineCycles = Random(15,25) then
+    Exit(Estate.DO_ANTIBAN);
+
+  if Inventory.IsFull() then
+    Exit(Estate.DEPOSIT_ROCKS);
+
+  if Minimap.IsSpecWeapon() and (Minimap.GetSpecLevel = 100) and (not Inventory.IsFull()) and (RSW.GetMyPos.DistanceTo(SpotTile) <= 12) then
+      Exit(EState.USE_SPEC);
+
+    Exit(EState.MINE_ROCKS);
+
+    WriteLn('Inventory Count ', Self.Inventories);
+end;
+
+begin
+  if (not DirectoryExists(AppPath+'\Resources\')) then
+    CreateDirectory(AppPath+'\Resources');
+
+  if (not FileExists(AppPath+'\Resources\PRUSHAMETHYST.png')) then
+    DownloadToFile('https://i.imgur.com/Pj694lx.png', AppPath+'\Resources\PRUSHAMETHYST.png');
+
+  GUI.Setup('Prush Amethyst', [500,500]);
+  GUI.PageControl.SetAllChildsFontColor($0000FF);
+  GUI.Run;
+
+  if (not RSClient.IsLoggedIn) then
+    if Login.GetPlayer.Password <> '' then
+      Login.LoginPlayer
+    else
+      TerminateScript('No player credentials');
+end;
+
+begin
+
+
+  Bot.Run(100, 1000000);
+
+end.
+
+
