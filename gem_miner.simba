@@ -1,0 +1,581 @@
+{$DEFINE SCRIPT_ID := 'ba9332c5-1bbc-4558-a841-b819931d004c'}
+{$DEFINE SRL_USE_REMOTEINPUT}
+{$DEFINE SCRIPT_REVISION := '3'}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+
+
+begin
+  Login.PlayerIndex := 1;
+end;
+
+type
+  TMiner = record
+    DebugMode, ForceDeposit, UseSpecialAttack, StartCrashTimer: Boolean;
+    TotalActions, RockIndex, StartingXp: Int32;
+    Runtime: TStopWatch;
+    MiningTimer, MaxRuntimeCD, InactivityTimer, ReportTimer,
+    SpecTimer, CrashTimer: TCountdown;
+    RSW: TRSWalker;
+    DepBoxFinder: TRSObjectFinder;
+    Version: String;
+  end;
+
+  TGUI = record(TScriptForm)
+    BreakAfter, BreakFor,
+    SleepAt, SleepFor,
+    MaxActions, MaxRuntime: TLabeledEdit;
+  end;
+
+const
+  SPEC_PICKS: array of TRSItem := ['Crystal pickaxe, Infernal pickaxe', 'Dragon pickaxe'];
+  GEMS: array of TRSItem := ['Uncut opal', 'Uncut jade', 'Uncut red topaz',
+                            'Uncut sapphire', 'Uncut emerald', 'Uncut ruby',
+                            'Uncut diamond'];
+  ROCKS: TPointArray := [[4069, 790], [4063, 790], [4061, 794], [4043, 794],
+                         [4039, 790], [4035, 785], [4027, 776], [4036, 768],
+                         [4037, 764], [4020, 769], [4019, 762], [4016, 757],
+                         [4016, 753], [4020, 749], [4024, 745], [4046, 748],
+                         [4053, 744], [4058, 744], [4035, 729], [4039, 717],
+                         [4044, 721], [4052, 720], [4056, 721], [4061, 726],
+                         [4073, 726], [4086, 745], [4089, 749], [4093, 749],
+                         [4097, 753], [4101, 753], [4105, 753], [4105, 770],
+                         [4109, 765]];
+  NEARBY_BANK_BOX: TBox := [4074, 775, 4090, 818];
+  ROCK_COL: TCTS2Color := CTS2(7276913, 16, 0.03, 1.01);
+  BANK_COORDS: TPoint := [4080, 785];
+  NO_HOP_BOX : TBox := [4060, 733, 4092, 803];
+
+var
+  Miner: TMiner;
+  GUI: TGUI;
+  _MaxActions: Int32;
+  _MaxRuntime: Int64;
+
+procedure TGUI.StartScript(sender: TObject); override; begin
+  Antiban.AddBreak(ONE_MINUTE*StrToInt(BreakAfter.GetText()),
+                  ONE_MINUTE*StrToInt(BreakFor.GetText()));
+  Antiban.AddSleep(SleepAt.GetText(),
+                  StrToInt(SleepFor.GetText()) * ONE_HOUR);
+  _MaxActions := StrToInt(MaxActions.GetText());
+  _MaxRuntime := StrToInt(MaxActions.GetText())*ONE_MINUTE;
+  inherited;
+end;
+
+procedure TGUI.Run(); override;
+var
+  tab: TTabSheet;
+begin
+  Self.Setup('Gem Miner');
+  Self.Start.setOnClick(@Self.StartScript);
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+  Self.CreateAccountManager(tab);
+
+  with Self.BreakAfter do begin
+    Create(tab);
+    SetCaption('Break after');
+    SetLeft(TControl.AdjustToDPI(100));
+    SetTop(TControl.AdjustToDPI(200));
+    SetText(ToStr(Random(24, 58)));
+    SetHint('Minutes');
+  end;
+
+  with Self.BreakFor do begin
+    Create(tab);
+    SetCaption('Break for');
+    SetLeft(TControl.AdjustToDPI(100));
+    SetTop(TControl.AdjustToDPI(240));
+    SetText(ToStr(Random(3, 15)));
+    SetHint('Minutes');
+  end;
+
+  with Self.SleepAt do begin
+    Create(tab);
+    SetCaption('Sleep at');
+    SetLeft(TControl.AdjustToDPI(100));
+    SetTop(TControl.AdjustToDPI(300));
+    SetText('01:00:00');
+  end;
+
+  with Self.SleepFor do begin
+    Create(tab);
+    SetCaption('Sleep for');
+    SetLeft(TControl.AdjustToDPI(100));
+    SetTop(TControl.AdjustToDPI(340));
+    SetText(ToStr(Random(6, 14)));
+    SetHint('Hours');
+  end;
+
+  with Self.MaxActions do begin
+    Create(tab);
+    SetCaption('Max actions');
+    SetLeft(TControl.AdjustToDPI(400));
+    SetTop(TControl.AdjustToDPI(200));
+    SetText(ToStr(Random(5000, 50000)));
+  end;
+
+  with Self.MaxRuntime do begin
+    Create(tab);
+    SetCaption('Max runtime');
+    SetLeft(TControl.AdjustToDPI(400));
+    SetTop(TControl.AdjustToDPI(240));
+    SetText(ToStr(Random(60, 12000)));
+    SetHint('Minutes');
+  end;
+
+  Self.CreateVersionPanel(tab);
+  Self.CreateAPISettings();
+  inherited;
+end;
+
+procedure TMouse.RandomMovement(); override;
+var
+  cachedSpeed: Int32;
+begin
+  cachedSpeed := Self.Speed;
+
+  Self.Speed := SRL.NormalRange(7, 11);
+  Self.Move(Box(Mouse.Position(), 75, 75), True);
+
+  Self.Speed := cachedSpeed;
+end;
+
+procedure TMiner.DoAntiban(); begin
+  InactivityTimer.Pause;
+  Antiban.DoAntiban;
+  InactivityTimer.Resume;
+end;
+
+procedure TMiner.DebugLn(s: String); begin
+  if DebugMode then WriteLn(s);
+end;
+
+function ProgReport(ResultType:int32; ScriptName, ScriptAuthor, ScriptVersion: String;
+                    VarNames: TStringArray;
+                    VarValues: TVariantArray
+                    ): Variant;
+var
+  TSA        : TStringArray;
+  s,s2       : String;
+  s3         : String := '=';
+  s4         : String := ' ';
+  i, i2, L   : Int32;
+begin
+  if (ResultType = 2) then
+    Result := '';
+
+  if length(VarNames) <> Length(VarValues) then
+  begin
+    Writeln('VarNames and VarValues must be the same length');
+    exit;
+  end;
+  SetLength(TSA, 3 + Length(VarNames) + 4);
+  s2 := 'by '+ScriptAuthor;
+
+  TSA[0] := s3;
+  TSA[1] := ScriptName.Capitalize+' '+ScriptVersion;
+  TSA[2] := s2;
+  TSA[3] := s3;
+
+  i2 := 3 + Length(VarNames);
+
+  for i:= 4 to i2 do
+    L := Max(L, Length(VarNames[i-4]));
+
+  for i:= 4 to i2 do
+  begin
+    s := VarValues[i-4];
+    TSA[i] := Padr((VarNames[i-4]).Capitalize, L)+' : '+ s.Capitalize;
+  end;
+
+  TSA[i2+1] := s3;
+  TSA[i2+2] := ScriptName.Capitalize+' '+ScriptVersion;
+  TSA[i2+3] := s3;
+
+  i2 := 0;
+  for i:= 0 to High(TSA) do
+    i2 := Max(i2, Length(TSA[i]));
+
+  TSA[0]           := s3.Replicate(i2);
+  TSA[3]           := s3.Replicate(i2);
+  TSA[High(TSA)-2] := s3.Replicate(i2);
+  TSA[High(TSA)]   := s3.Replicate(i2);
+
+  TSA[2] := s4.Replicate(round((i2 - Length(TSA[2]))/2)) + TSA[2]; //centering by ScriptAuthor
+  TSA[High(TSA)-1] := s4.Replicate(round((i2 - Length(TSA[High(TSA)-1]))/2)) + TSA[High(TSA)-1];
+
+  for i:= 0 to High(TSA) do
+    if (TSA[i][1] = s3) then
+      case ResultType of
+        0 : writeln     ('[='+Padr(TSA[i], i2)+'=]');
+        1 : writeln     ('[='+Padr(TSA[i], i2)+'=]');
+        2 : Result := Result + '[='+Padr(TSA[i], i2)+'=]' + chr(13);
+        else begin Writeln('Invalid Result Type'); exit; end;
+      end
+    else
+      case ResultType of
+        0 : writeln     ('[ '+Padr(TSA[i], i2)+' ]');
+        1 : writeln     ('[ '+Padr(TSA[i], i2)+' ]');
+        2 : Result := Result + '[ '+Padr(TSA[i], i2)+' ]' + chr(13);
+        else begin Writeln('Invalid Result Type'); exit; end;
+      end;
+
+  if not ResultType = 2 then Result := true;
+end;
+
+procedure TMiner.Report();
+var
+  SArr: TStringArray;
+  VArr: TVariantArray;
+  XPGained: Int32;
+begin
+  XPGained := XPBar.Read - StartingXp;
+  SArr := ['Runtime', 'Xp gained', 'Xp per hour', 'Gems mined',
+           'Gems per hour', 'Next Break', 'Until shutdown'];
+  VArr := [
+  {runtime}         SRL.MsToTime(Runtime.ElapsedTime, Time_Short),
+  {xp gained}       ToStr(XPGained),
+  {xp per hour}     NumberPerHour(XPGained, Runtime.ElapsedTime),
+  {planks made}     ToStr(Floor(XPGained/65)),
+  {planks per hour} NumberPerHour(Floor(XPGained/65), Runtime.ElapsedTime),
+  {next break}      Antiban.TimeUntilBreak(Antiban.Breaks[0]),
+  {until shutdown}  SRL.MsToTime(MaxRuntimeCD.TimeRemaining, Time_Short)];
+  if not DebugMode then ClearDebug;
+  ProgReport(1, 'Gem Miner','Club XJ', Version, SArr, VArr);
+  ReportTimer.Restart;
+end;
+
+procedure Antiban.RightClickPlayer(); begin
+  Antiban.HoverMSTile(ERSMinimapDot.PLAYER, True);
+  Wait(500, 1600);
+  Mouse.RandomMovement();
+end;
+
+procedure Antiban.RightClickItem(); begin
+  Antiban.HoverMSTile(ERSMinimapDot.ITEM, True);
+  Wait(500, 1600);
+  Mouse.RandomMovement();
+end;
+
+procedure Antiban.DoLoseFocus();
+var
+  t: Int32;
+begin
+  t := SRL.NormalRange(1*ONE_SECOND, 8*ONE_SECOND);
+  Antiban.DebugLn('Losing focus for '+SRL.MsToTime(t, Time_Short));
+  Antiban.LoseFocus(t);
+end;
+
+procedure _OnStartSleep(task: PSleepTask);
+begin
+  Miner.Runtime.Pause;
+  task^.Length;
+end;
+
+procedure _OnFinishSleep(task: PSleepTask); begin
+
+  Miner.Runtime.Resume;
+  task^.Length;
+end;
+
+procedure _OnStartBreak(task: PBreakTask); begin
+  if task^.Length > ONE_MINUTE then
+    Miner.Runtime.Pause
+end;
+
+procedure _OnFinishBreak(task: PBreakTask); begin
+  if Miner.Runtime.IsPaused then
+    Miner.Runtime.Resume;
+  task^.Length;
+end;
+
+procedure TMiner.Init();
+var
+  i: Int32;
+  d: Double;
+begin
+  Version := 'Rev '+{$MACRO SCRIPT_REVISION};
+
+  DebugMode := False;
+  RSW.Setup([RSRegions.GEM_ROCKS_MINE]);
+  RSW.WebGraph.LoadNodesFromString('ogAAAHicbYy5DcAwDANX0QgibUn2LEb2XyMU4CJFusPxOeQwZD0HawpSUGmI1RCGOTqiYeA5dDdQhohrCHWi4f6QW4aCqcPw3yj9rpYgZxv91O6VOvVZvbgnJNQ=');
+  RSW.WebGraph.LoadPathsFromString('ZQAAAHicJcvJEcAwEALBVAhBo9OKhSL/NLwuv5gHbeKmHqMRd814aMVTO146uvHWE59vafEViDrTxAf5syRDlGWK0ixRqvIF+v0Ytw==');
+
+  //Skill tab
+  StartingXp := XPBar.Read;
+  i := Stats.GetLevel(ERSSkill.MINING);
+  d := Floor(84*(99-i)/98) + Floor(210*(i-1)/98) + 1;
+  d := Min(Max(d/256, 0), 1);
+
+  //Timers
+  MiningTimer.Init(Floor(2400/d)+4800);
+  ReportTimer.Init(30*ONE_SECOND);
+  InactivityTimer.Init(10*ONE_MINUTE);
+
+  //Options tab
+  Options.SetZoomLevel(Random(28, 32));
+  Mainscreen.SetHighestPitch;
+
+  //Antiban
+  Antiban.Skills += ERSSkill.MINING;
+  Antiban.Skills += ERSSkill.TOTAL;
+  Antiban.AddTask(ONE_MINUTE*2,   @Mouse.RandomMovement);
+  Antiban.AddTask(ONE_MINUTE*14,  @Antiban.DoLoseFocus);
+  Antiban.AddTask(ONE_MINUTE*8,   @Antiban.RightClickPlayer);
+  Antiban.AddTask(ONE_MINUTE*13,  @Antiban.RightClickItem);
+  Antiban.AddTask(ONE_MINUTE*15,  @Antiban.HoverSkills);
+  Antiban.AddBreak(ONE_MINUTE*13, ONE_SECOND*22, 0.2, 0.0);
+  Antiban.MinZoom := 28; Antiban.MaxZoom := 32;
+  Antiban.OnStartSleep := @_OnStartSleep;
+  Antiban.OnFinishSleep := @_OnFinishSleep;
+  Antiban.OnStartBreak := @_OnStartBreak;
+  Antiban.OnFinishBreak := @_OnFinishBreak;
+
+  DepBoxFinder.ColorClusters += [CTS2(3622747, 13, 0.04, 0.08),
+                                 CTS2(6447720, 5, 0.56, 0.19),
+                                 6];
+
+  //Mouse
+  Mouse.Speed := Random(14, 18);
+  Mouse.MissChance := Random(2, 3);
+end;
+
+function TMiner.PlayersNearby(): Boolean;
+var
+  dots, nohop: TPointArray;
+  dot: TPoint;
+begin
+  dots := Minimap.GetDots(ERSMinimapDot.PLAYER);
+  if dots.Len = 0 then Exit(False);
+  nohop := RSW.WorldToMM(TPAFromBox(NO_HOP_BOX));
+  FilterPointsDist(dots, 0, 40, Minimap.Center.X, Minimap.Center.Y);
+  for dot in dots do
+    if nohop.Contains(dot) then
+      dots.remove(dot);
+  Result := dots.Len <> 0;
+end;
+
+function TMiner.DoBanking(attempts: Int32 = 0): Boolean;
+var
+  atpa: T2DPointArray;
+  mmwalkpoint: TPoint;
+  bankBox, depAllBox: TBox;
+begin
+  if attempts > 10 then Exit(False);
+  if not DepositBox.IsOpen then begin
+    bankBox := RSW.GetTileMS(BANK_COORDS, 5).Bounds().Expand(10);
+    atpa := Mainscreen.FindObject(DepBoxFinder, bankBox);
+    if (atpa.Len = 0) or (atpa[0].Len = 0) then begin
+      if attempts = 0 then begin
+        mmwalkpoint := RSW.WorldToMM(TPAFromBox(NEARBY_BANK_BOX)).RandomValue();
+        Mouse.Click(mmwalkpoint, MOUSE_LEFT);
+        Mouse.RandomMovement();
+        Wait(600);
+        Minimap.WaitPlayerMoving();
+      end else RSW.WalkBlind(TPAFromBox(NEARBY_BANK_BOX).RandomValue(), 8);
+      Exit(DoBanking(attempts + 1));
+    end;
+    for 1 to 3 do begin
+      Mouse.Move(atpa[0]);
+      if 'Bank' in Mainscreen.GetUpText then begin
+        Mouse.Click(MOUSE_LEFT);
+        //TODO hover near deposit all button.
+        depAllBox := Mainscreen.Bounds;
+        depAllBox.X1 := (depAllBox.X1 - Floor(depAllBox.X1 / 1.5));
+        depAllBox.Y1 := (depAllBox.Y1 - Floor(depAllBox.Y1 / 1.5));
+        Mouse.Move(depAllBox);
+        Break;
+      end;
+    end;
+    Minimap.WaitPlayerMoving();
+    if not DepositBox.IsOpen(5000) then begin
+      RSW.WalkBlind(TPAFromBox(NEARBY_BANK_BOX).RandomValue(), 8);
+      Exit(DoBanking(attempts + 1));
+    end;
+  end;
+  DepositBox.DepositAll();
+  if not DepositBox.ClickItem('Open gem bag', 'Empty') then
+    Wait(88, 201);
+  if WaitUntil(not Inventory.IsFull, 50, 5000) then begin
+    DepositBox.Close(True);
+    ForceDeposit := False;
+    RockIndex := 0;
+    Exit(True);
+  end else
+    Exit(DoBanking(attempts + 1));
+end;
+
+function TMiner.GetRockTPA(out tpa: TPointArray; index: Int32): Boolean;
+var
+  p, mypos: TPoint;
+  box1, box2: TBox;
+  tpa1, tpa2: TPointArray;
+begin
+  tpa := [];
+  Result := False;
+  mypos := RSW.GetMyPos();
+  box1 := RSW.GetTileMSEx(mypos, ROCKS[index]).Bounds();
+  if index <> High(ROCKS) then
+    box2 := RSW.GetTileMSEx(mypos, Rocks[index + 1]).Bounds();
+
+  if Mainscreen.Bounds().Contains(box1) then begin
+    SRL.FindColors(tpa1, ROCK_COL, box1);
+    if index = High(Rocks) then begin
+      tpa := tpa1;
+      Exit(tpa.Len > 10);
+    end;
+    if (tpa1.Len > 0) and Mainscreen.Bounds().Contains(box2) then begin
+      SRL.FindColors(tpa2, ROCK_COL, box2);
+      if tpa2.Len > 0 then begin
+        for p in tpa1 do
+          if tpa2.Find(p) = -1 then
+            tpa += p;
+        tpa.ClearDuplicates();
+        tpa.Sort();
+      end
+    end
+  end
+  Result := tpa.Len > 10;
+end;
+
+function TMiner.ClickRock(tpa: TPointArray; attempts: Int32 = 1): Boolean;
+var
+  filteredTPA: TPointArray;
+  middle: TPoint;
+begin
+  if attempts <= 2 then begin
+    if (not tpa.Contains(Mouse.Position)) and (not ('Gem' in Mainscreen.GetUpText)) then begin
+      middle := tpa.Mean();
+      filteredTPA := tpa.FilterDist(0, 8, middle.X, middle.Y);
+      Mouse.Move(filteredTPA);
+    end
+    if not ('Gem' in Mainscreen.GetUpText) then
+      Exit(ClickRock(tpa, attempts + 1));
+    Mouse.Click(MOUSE_LEFT);
+    Result := Mainscreen.DidRedClick();
+  end else if attempts < 5 then begin
+    if GetRockTPA(tpa, RockIndex) then begin
+      if (not tpa.Contains(Mouse.Position)) and (not ('Gem' in Mainscreen.GetUpText)) then
+        Mouse.Move(tpa.Mean);
+      if not ('Gem' in Mainscreen.GetUpText) then
+        Exit(ClickRock([], attempts + 1));
+      Mouse.Click(MOUSE_LEFT);
+      Result := Mainscreen.DidRedClick();
+    end else
+      Exit(ClickRock([], attempts + 1));
+  end else Result := False;
+end
+
+procedure TMiner.HoverNextRock();
+var
+   filteredTPA, tpa: TPointArray;
+   middle: TPoint;
+begin
+  if not GetRockTPA(tpa, RockIndex +1) then
+    Exit;
+  middle := tpa.Mean();
+  filteredTPA := tpa.FilterDist(0, 8, middle.X, middle.Y);
+  Mouse.Move(filteredTPA);
+end;
+
+procedure TMiner.Run(maxactions: Int32; maxruntime: Int64);
+var
+  compass: Double;
+  invcount: Int32;
+  tpa: TPointArray;
+  resetinactive: Boolean;
+begin
+  MaxRuntimeCD.Init(maxruntime);
+  if not RSClient.IsLoggedIn then Login.LoginPlayer;
+  Self.Init;
+  Runtime.Start;
+
+  While PlayersNearby() do begin
+    WorldHopper.Hop(Login.GetPlayer().Worlds);
+    if InactivityTimer.IsFinished() then
+      TerminateScript('Failed to find an open world in a reasonable amount of time.');
+  end;
+
+  repeat
+    if not RSClient.IsLoggedIn then Login.LoginPlayer;
+    if ReportTimer.IsFinished then Report;
+    if Chat.LeveledUp then Chat.HandleLevelUp;
+    if XPBar.EarnedXP() then InactivityTimer.Restart();
+
+    if PlayersNearby() then begin
+      if StartCrashTimer then begin
+        CrashTimer.Init(10*ONE_SECOND);
+        StartCrashTimer := False;
+        DebugLn('Player detected, starting crash timer');
+      end
+      if CrashTimer.IsFinished() then begin
+        repeat
+          WorldHopper.Hop(Login.GetPlayer().Worlds);
+          if InactivityTimer.IsFinished() then
+            TerminateScript('Failed to find an open world in a reasonable amount of time.');
+        until not PlayersNearby();
+      end
+    end else begin
+      StartCrashTimer := True;
+    end;
+
+    compass := Minimap.GetCompassAngle();
+    if (compass < 259) or (compass > 279) then
+      Minimap.SetCompassAngle(Random(260, 280));
+
+    if (RockIndex > High(ROCKS)) or Inventory.IsFull() then begin
+      if not DoBanking() then
+         TerminateScript('Failed to bank');
+      Self.DoAntiban();
+      RockIndex := 0;
+    end;
+
+    if RSW.GetMyPos.DistanceTo(ROCKS[RockIndex]) > 45 then begin
+      RSW.WalkBlind(ROCKS[RockIndex], 15);
+      Minimap.WaitPlayerMoving();
+    end;
+
+    if (not GetRockTPA(tpa, RockIndex)) or (not GetRockTPA(tpa, RockIndex)) then begin
+      DebugLn('Couldn''t find rock ' + ToStr(RockIndex));
+      RockIndex += 1;
+      Continue;
+    end;
+
+    if ClickRock(tpa) then begin
+      if SRL.Dice(30) then
+        Mouse.RandomMovement();
+      if SRL.Dice(3) then
+        Antiban.LoseFocus(Floor(Random()*2*ONE_SECOND));
+      Wait(600);
+      Minimap.WaitPlayerMoving();
+      if RockIndex <> High(ROCKS) then
+        HoverNextRock();
+      MiningTimer.Restart();
+      invcount := Inventory.Count();
+      repeat until (resetinactive := XPBar.EarnedXP()) or
+                   (resetinactive := (invcount < Inventory.Count)) or
+                    MiningTimer.IsFinished();
+      RockIndex += 1;
+      if resetinactive then InactivityTimer.Restart();
+      resetinactive := False;
+    end else Mouse.RandomMovement();
+
+  until InactivityTimer.IsFinished() or
+        MaxRuntimeCD.IsFinished() or
+        (TotalActions > maxactions);
+
+  if InactivityTimer.IsFinished() then
+    WriteLn('Terminating, No xp gained in 10 minutes')
+  else if MaxRuntimeCD.IsFinished() then
+    WriteLn('Terminating, max runtime reached')
+  else if TotalActions > maxactions then
+    WriteLn('Terminating, max actions reached');
+
+end;
+
+begin
+  GUI.Run();
+  Miner.Run(_MaxActions, _MaxRuntime);
+end.
