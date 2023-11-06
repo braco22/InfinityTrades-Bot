@@ -1,0 +1,888 @@
+{$UNDEF SCRIPT_ID}{$DEFINE SCRIPT_ID := ''}
+{$UNDEF SCRIPT_REVISION}{$DEFINE SCRIPT_REVISION := '6'}
+{$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+{$I WaspLib/osr/interfaces/annettesnets.simba}
+{$I WaspLib/osr/interfaces/driftnet.simba}
+type
+  TridentType = (
+    MERFOLK_TRIDENT,
+    TRIDENT_OF_SEA,
+    TRIDENT_OF_SWAMP,
+    DRAGON_HARPOON,
+    NONE
+  );
+
+  PotionType = (
+    STAMINA_POTION,
+    SUPER_ENERGY,
+    NO_POTION
+  );
+
+  NetCount = (
+    FIVE,
+    TEN,
+    ALL
+  );
+//==========================SETTINGS============================================
+
+begin
+  Login.PlayerIndex := 0;
+end;
+
+var
+  WEAPON: TridentType         = MERFOLK_TRIDENT; //trident in use
+  POTION: PotionType          = STAMINA_POTION;  //potion to use for run restore
+  NETAMOUNT: NetCount         = TEN;             // how many unnotted drift nets to carry (they are heavy)
+
+  ENABLEBANKCATCH: Boolean    = True;            //bank catch
+  CHECKCOLLECT: Boolean       = False;           //use collect box
+
+  POTIONAMOUNT: Int32         = 4;               //energy restore potions to bring
+  MOUSEOVERRIDE: Int32        = 0;              //override mouse speed. 0 to disable. 25 for 160kish xp.
+
+//==============================================================================
+
+type
+  EState = (
+    CLICK_FISH,
+    CHECK_NET,
+    CLOSE_INTERFACE,
+    CLICK_ANCHOR,
+    CLICK_ANNETTE,
+    DIVE,
+    DRINK_STAMINA,
+    CLICK_TUNNEL,
+    SET_NET,
+    ENTER_ENTRYWAY,
+    ENTER_ARENA,
+    EQUIP_TRIDENT,
+    UNEQUIP_TRIDENT,
+    ENABLE_RUN,
+    OPEN_COLLECT,
+    OPEN_BANK,
+    WITHDRAW_STAMINA,
+    COLLECT_NETS,
+    BANK_CATCH,
+    HANDLE_CHAT,
+    DEPOSIT_NETS_ANNETTE,
+    WITHDRAW_ALL_ANNETTE,
+    WITHDRAW_FIVE_ANNETTE
+  );
+
+  Shoal = record
+  TPA: TPointArray;
+  Dist: double;
+  end;
+
+  ReldsDriftNetFisher = record(TBaseWalkerScript)
+    State: EState;
+
+    StartXp, NetCountInt: Int32;
+
+    Trident, EnergyItem: TRSBankItem;
+
+    Banking, NeedCollect: Boolean;
+
+    Position: TPoint;
+
+    Annette: TRSObject;//setting her up as npc does not work. it cant find her yellow dot?
+
+    FishLoot: TRSItemArray;
+  end;
+var
+  HuntLvl, FishLvl: int32;
+
+procedure TAntiban.Setup(); override;
+begin
+  Self.Skills := [ERSSkill.TOTAL, ERSSkill.FISHING, ERSSkill.HUNTER];
+  Self.MinZoom := 0;
+  Self.MaxZoom := 10;
+
+  inherited;
+end;
+
+procedure TRSObject.SetObject(objUpText: TStringArray; coordinates: TPointArray; shape: Vector3);
+begin
+  Self := [];
+  Self.SetupEx(shape, coordinates);
+  Self.Setup(objUpText);
+
+  Filter := [True, False, True, True];
+end;
+
+procedure ReldsDriftNetFisher.SetupAnnette();
+begin
+    Self.Annette.SetObject(['Annette'], [[1299,5506]], [1, 1, 7]);
+    Self.Annette.Finder.Colors += CTS2(9670261, 14, 0.27, 0.32);
+
+    Self.Annette.Finder.ClusterDistance := 3;
+    Self.Annette.Finder.Erode := 2;
+    Self.Annette.Finder.Grow := 2;
+end;
+
+procedure ReldsDriftNetFisher.DepositAllNetsAnnette();
+begin
+  Inventory.ItemInterface.InteractItem('noted drift net','Store-All');
+  WaitUntil((AnnettesNets.ItemInterface.CountStack(0) > 0), 50, 3000);
+end;
+
+procedure ReldsDriftNetFisher.WithdrawFiveNetsAnnette();
+var
+  count: Int32;
+begin
+  count := Inventory.ItemInterface.Count('Drift net');
+  AnnettesNets.ItemInterface.InteractSlot(0, 'Withdraw-5');
+  WaitUntil((Inventory.ItemInterface.Count('Drift net') > count), 50, 3000);
+end;
+
+procedure ReldsDriftNetFisher.WithdrawAllNetsAnnette();
+begin
+  AnnettesNets.ItemInterface.InteractSlot(0, 'Withdraw-All');
+  WaitUntil((Inventory.ItemInterface.Count('Drift net') > 0), 50, 3000);
+end;
+
+procedure ReldsDriftNetFisher.ClickAnnette();
+var
+  TPA: TPointArray;
+  Circle: TCircle;
+begin
+  try
+    if Self.Annette.WalkSelectOption(['Nets']) then
+      WaitUntil(Mainscreen.HasInterface,100,3000);
+  except
+    Antiban.RandomRotate();
+    if SRL.FindColors(TPA, CTS2(62433, 1, 0.01, 0.01), Minimap.bounds) then
+    begin
+      writeln('Im lost :( trying to click on annette via map.');
+      Circle := [TPA.RandomValue.X, TPA.RandomValue.Y, 10];
+      Mouse.click(Circle, MOUSE_LEFT);
+    end;
+  end;
+  Self.DoAntiban();
+end;
+
+procedure ReldsDriftNetFisher.CloseInterface();
+begin
+  Keyboard.PressKey(VK_ESCAPE);
+  Self.DoAntiban();
+end;
+
+procedure ReldsDriftNetFisher.SetNet();
+var
+  TPA,TPA2 :TPointArray;
+  count: Int32;
+begin
+  count := Inventory.CountItem('Drift net');
+  if SRL.FindColors(TPA, CTS2(3978405, 3, 0.10, 1.05), Mainscreen.bounds()) then //found yellow outline
+  begin
+    if  SRL.FindColors(TPA2, CTS2(6578001, 11, 0.08, 0.38), TPA.Bounds()) then
+    begin
+      Mouse.Move(TPA2.RandomValue());
+      if Mainscreen.IsUpText(['Set', 'up']) then
+      begin
+        Mouse.click(MOUSE_LEFT);
+        Wait(800, 1200);
+      end
+      else
+      begin
+        Mouse.Move(TPA.ShapeFill().RandomValue());
+        if Mainscreen.IsUpText(['Set', 'up']) then
+        begin
+          Mouse.click(MOUSE_LEFT);
+          Wait(800, 1200);
+        end
+        else
+          Mouse.click(MOUSE_LEFT);
+      end;
+    end;
+  end;
+  if count > Inventory.CountItem('Drift net') then
+  begin
+    Self.TotalActions += 1;
+    Self.TotalProfit += ItemData.GetAverage('Drift net') * -1;
+  end;
+  Self.DoAntiban();
+end;
+
+procedure ReldsDriftNetFisher.CheckNet();
+var
+TPA :TPointArray;
+begin
+  if SRL.FindColors(TPA, CTS2(4077980, 5, 0.06, 1.59), Mainscreen.bounds()) then
+  begin
+    Mouse.Move(TPA.ShapeFill.Erode(1).RandomValue());
+    if Mainscreen.IsUpText('(full)') then
+    begin
+      Mouse.Click(MOUSE_LEFT);
+      Wait(100, 200);
+      Minimap.WaitMoving(false);
+      waitUntil(Mainscreen.HasInterface(), 100, 2000);
+    end;
+  end;
+end;
+
+procedure ReldsDriftNetFisher.DrinkStamina();
+begin
+   Inventory.Consume(ENERGY_CONSUMABLE);
+   Self.TotalProfit += Round(ItemData.GetAverage(Self.EnergyItem.Item) * -0.25) ;
+end;
+
+procedure ReldsDriftNetFisher.WieldTrident();
+begin
+   Inventory.Open();
+   if Inventory.ClickItem(Self.Trident.item, 'Wield')
+   and WaitUntil(Chat.HasContinue(), 100, 2000)
+   and Chat.ClickContinue() then
+    if Chat.ClickOption('steer clear')then
+      wait(300, 600);
+end;
+
+procedure ReldsDriftNetFisher.OpenCollectBox();
+begin
+   if RSObjects.BankChestFossilIsland.WalkSelectOption(['Collect']) then
+    CollectBox.IsOpen(5000);
+end;
+
+procedure ReldsDriftNetFisher.OpenBank();
+begin
+   if RSObjects.BankChestFossilIsland.WalkClick() then
+    Bank.IsOpen(5000);
+   Self.DoAntiban();
+end;
+
+procedure ReldsDriftNetFisher.Dive();
+begin
+  if RSObjects.FossilIslandRowboat.WalkSelectOption(['Dive']) then
+   begin
+    wait(120);
+    Minimap.WaitMoving(false);
+    SRL.IsAnimating(Minimap.Bounds, 1000, 3000, 1);
+    end;
+end;
+
+procedure ReldsDriftNetFisher.DoWithdraw();
+var
+nets, notedNets: TRSBankItem;
+begin
+  if Inventory.CountEmptySlots < POTIONAMOUNT then
+  begin
+    nets := TRSBankItem.Setup('drift net', Bank.QUANTITY_ALL);
+    notedNets := TRSBankItem.Setup('drift net',Bank.QUANTITY_ALL, true);
+    if Bank.DepositItem(nets,false) then
+      Bank.WithdrawItem(notedNets,false);
+  end;
+
+  if Bank.WithdrawItem(Self.EnergyItem, false) then
+    Self.Banking := false;
+
+  wait(1200);
+end;
+
+procedure ReldsDriftNetFisher.BankCatch();
+var
+  item: TRSItem;
+  box: TBox;
+  itemValue, count: Int32;
+begin
+  for item in Self.FishLoot do
+  begin
+    if Driftnet.ItemInterface.Find([item], box) then
+    begin
+      count := SRL.GetItemAmount(box);
+      if count = 0 then count := 1
+      else if count = -1 then count := 0;
+      itemValue += Itemdata.GetAverage(item) * count;
+    end;
+  end;
+
+  Driftnet.GetButton(ERSDriftNetButton.BANK_ALL).click();
+  WaitUntil(Driftnet.BankOverlayOpen(), 50, 2000);
+  Driftnet.GetButton(ERSDriftNetButton.OVERLAY_CONFIRM).click();
+  wait(140,200);
+  if Driftnet.IsOpen() then
+    Self.CloseInterface();
+
+  Self.TotalProfit += ItemData.GetAverage('Numulite') * -5;
+  Self.TotalProfit += itemValue;
+  Self.DoAntiban();
+end;
+
+procedure ReldsDriftNetFisher.DoCollect();
+begin
+  CollectBox.ClickItem('Drift net', 'Collect-note');
+  Self.NeedCollect := false;
+end;
+
+procedure ReldsDriftNetFisher.ClickAnchor();
+begin
+   if RSObjects.FossilIslandAnchorRope.WalkClick() then
+   begin
+    wait(120);
+    Minimap.WaitMoving(false);
+    wait(1800,2000);
+    end;
+end;
+
+procedure ReldsDriftNetFisher.HandleChatOptions();
+begin
+      Chat.ClickOption('nter instance');
+      wait(1800,2000);
+end;
+
+procedure ReldsDriftNetFisher.ClickTunnel();
+begin
+   if RSObjects.DriftNetTunnel.WalkClick() then
+   begin
+    wait(120);
+    Minimap.WaitMoving(false);
+    wait(1800,2000);
+    end;
+end;
+
+procedure ReldsDriftNetFisher.ClickFish();
+var
+  ATPA, ATPA2: T2DPointArray;
+  TPA: TPointArray;
+  i: int32;
+  recordArray: Array of Shoal;
+  closestShoal, shoalRecord: Shoal;
+begin
+   ATPA := [];
+
+   SRL.FindColors(TPA, CTS2(9914247, 8, 0.27, 2.83), Mainscreen.bounds);
+
+   ATPA := TPA.Cluster(1);
+
+   for TPA in ATPA do
+    ATPA2 += TPA.ShapeFill().erode(2);
+
+   i := 0;
+   setLength(RecordArray,High(ATPA2) + 1);
+   for TPA in ATPA2 do
+   begin
+    recordArray[I].TPA := TPA;
+    recordArray[I].Dist := TPA.Mean().DistanceTo(Mainscreen.GetPlayerBox.Center);
+    Inc(I);
+   end;
+
+   closestShoal.Dist := 10000;
+   for shoalRecord in RecordArray do
+   begin
+    if shoalRecord.Dist < closestShoal.dist then
+    begin
+      closestShoal := shoalRecord;
+    end;
+   end;
+
+   if closestShoal.TPA then
+    Mouse.Move(closestShoal.TPA.RandomValue());
+
+   if mainscreen.IsUpText(['Chase']) then
+   begin
+    Mouse.Click(MOUSE_LEFT);
+    if MainScreen.DidRedClick() then
+    begin
+
+      Minimap.WaitPlayerMoving();
+      wait(200,300);
+    end;
+   end;
+end;
+
+function ReldsDriftNetFisher.LowEnergy(): Boolean; //stolen from torwent
+begin
+  Result := not Minimap.HasStamina and (Minimap.GetRunEnergy < Antiban.GetUniqueNumber(35, 30, 40));
+end;
+
+function ReldsDriftNetFisher.CheckNetFull(): Boolean;
+begin
+  try
+    Result := SRL.CountColor(CTS2(4077980, 5, 0.06, 1.59), Mainscreen.Bounds()) > 100;
+  except
+    Result := False;
+  end;
+end;
+
+function ReldsDriftNetFisher.CheckNetNotSet(): Boolean;
+begin
+  try
+    Result := SRL.CountColor(CTS2(3978405, 3, 0.10, 1.05), Mainscreen.Bounds()) > 100;
+  except
+    Result := False;
+  end;
+end;
+
+procedure ReldsDriftNetFisher.Init(maxActions: UInt32; maxTime: UInt64); override;
+begin
+  inherited;
+
+  RSW.Setup([RSregions.FOSSIL_ISLAND_UNDERWATER, RSregions.FOSSIL_ISLAND]);
+  if not inRange(Options.GetZoomLevel, 0, 10) then
+    Options.SetZoomLevel(random(0, 10));
+  Self.StartXp := XPbar.Read;
+  Self.SetupAnnette();
+  Self.FishLoot := ['Numulite','Oyster','Raw anchovies', 'Raw sardine',
+                    'Raw tuna', 'Raw lobster', 'Raw swordfish', 'Raw shark',
+                    'Raw sea turtle', 'Raw manta ray'];
+  if MOUSEOVERRIDE <> 0 then
+    Mouse.Speed := MOUSEOVERRIDE;
+
+  case WEAPON of
+    DRAGON_HARPOON: Self.Trident.Item := 'Dragon harpoon';
+    MERFOLK_TRIDENT: Self.Trident.Item := 'Merfolk trident';
+    TRIDENT_OF_SEA: Self.Trident.Item := 'Trident of the seas';
+    TRIDENT_OF_SWAMP: Self.Trident.Item := 'Trident of the swamp';
+  end;
+
+  case NETAMOUNT of
+    FIVE: Self.NetCountInt := 5;
+    TEN: Self.NetCountInt := 10;
+    ALL: Self.NetCountInt := 10;
+  end;
+
+  case POTION of
+    STAMINA_POTION: Self.EnergyItem := TRSBankItem.Setup('Stamina Potion(4)', POTIONAMOUNT);
+    SUPER_ENERGY: Self.EnergyItem := TRSBankItem.Setup('Super energy(4)', POTIONAMOUNT);
+  end;
+
+  Stats.Open();
+  HuntLvl := Stats.GetLevel(ERSSkill.HUNTER);
+  FishLvl := Stats.GetLevel(ERSSkill.FISHING);
+end;
+
+function ReldsDriftNetFisher.InEntryway(): Boolean;
+begin
+  if inRange(Self.Position.X, 1262, 1294) and inRange(Self.Position.Y, 5502, 5530) then
+    Result := True
+  else
+    Result := False;
+end;
+
+function ReldsDriftNetFisher.InArena(): Boolean;
+begin
+  if inRange(Self.Position.X, 1295, 1350) and inRange(Self.Position.Y, 5502, 5560) then
+    Result := True
+  else
+    Result := False;
+end;
+
+function ReldsDriftNetFisher.InOutside(): Boolean;
+begin
+  if inRange(Self.Position.X, 1258, 1282) and inRange(Self.Position.Y, 5531, 5590) then
+    Result := True
+  else
+    Result := False;
+end;
+
+function ReldsDriftNetFisher.InAboveSurface(): Boolean;
+begin
+  if inRange(Self.Position.X, 9444, 9500) and inRange(Self.Position.Y, 680, 720) then
+    Result := True
+  else
+    Result := False;
+end;
+
+procedure ReldsDriftNetFisher.UnEquipTrident();
+var
+  slot: int32;
+begin
+  if Inventory.IsFull() then
+  begin
+    Inventory.FindItem('Drift net',slot);
+    Inventory.ShiftDrop([slot]);
+    Self.TotalProfit += Itemdata.GetAverage('Drift net') * -1;
+  end;
+  if Equipment.ContainsItem(Self.Trident.Item) then
+    Equipment.GetButton(ERSEquipmentButton.WEAPON).click();
+end;
+
+procedure ReldsDriftNetFisher.EnterEntryway();
+begin
+  if (WEAPON <> TridentType.NONE) then
+    Self.UnEquipTrident();
+  if Self.Banking then
+  begin
+    RSObjects.DriftNetPlantDoor.WalkClick();
+    Wait(3000,4000);
+  end
+  else
+  begin
+    RSObjects.DriftNetTunnel.WalkClick();
+    Wait(1800);
+  end;
+end;
+
+procedure ReldsDriftNetFisher.EnterArena();
+begin
+  if RSObjects.DriftNetPlantDoor.WalkClick() then
+      Wait(3000,4000);
+end;
+
+function ReldsDriftNetFisher.GetState(): EState;
+begin
+  Self.Position := RSW.GetMyPos();
+
+  if Mainscreen.HasInterface then
+  begin
+    if Bank.IsOpen() and Self.Banking then
+      Exit(WITHDRAW_STAMINA);
+    if CollectBox.IsOpen() and Self.NeedCollect then
+      Exit(COLLECT_NETS);
+    if ENABLEBANKCATCH and DriftNet.IsOpen() then
+      Exit(BANK_CATCH);
+    if AnnettesNets.IsOpen() then
+      if (AnnettesNets.ItemInterface.CountStack(0) = 0) then
+        Exit(DEPOSIT_NETS_ANNETTE)
+      else if (Inventory.ItemInterface.Count('Drift net') < Self.NetCountInt) then
+        if (NETAMOUNT = ALL) then
+          Exit(WITHDRAW_ALL_ANNETTE)
+        else
+          Exit(WITHDRAW_FIVE_ANNETTE);
+
+    Exit(CLOSE_INTERFACE);
+  end;
+
+  if (Chat.GetChatTitle = "Ceto charges 200 numulites for a day's access.")
+  or (Chat.GetChatTitle = "You have already paid for access today.") then
+    Exit(HANDLE_CHAT);
+
+  if (Potion <> PotionType.NO_POTION) and not Self.Banking
+  and Inventory.Open() and (Inventory.CountConsumable(ERSConsumable.ENERGY_CONSUMABLE) = 0) then
+  begin
+    Self.Banking := True;
+    if CHECKCOLLECT then
+     Self.NeedCollect := True;
+  end;
+
+  if (WEAPON <> TridentType.NONE) and (Self.Banking or Self.InAboveSurface()) and not Inventory.ContainsItem(Self.Trident.item) then
+    Exit(UNEQUIP_TRIDENT);
+
+  if (Potion <> PotionType.NO_POTION) and Self.LowEnergy() then
+    Exit(DRINK_STAMINA);
+
+  if not Minimap.IsRunEnabled then
+    Exit(ENABLE_RUN);
+
+  if Self.Banking and Self.InArena() then
+    Exit(ENTER_ENTRYWAY);
+
+  if Self.InEntryway() then
+  begin
+    if Self.Banking then
+      Exit(CLICK_TUNNEL);
+
+    Exit(ENTER_ARENA);
+  end;
+
+  if Self.InOutSide() then
+  begin
+    if Self.Banking then
+      Exit(CLICK_ANCHOR);
+
+    Exit(ENTER_ENTRYWAY);
+  end;
+
+  if Self.InAboveSurface() then
+  begin
+    if Self.Banking and Self.NeedCollect then
+      Exit(OPEN_COLLECT);
+
+    if Self.Banking then
+      Exit(OPEN_BANK);
+
+    Exit(EState.DIVE);
+  end;
+
+  if (WEAPON <> TridentType.NONE) and (Self.Banking = false) and Inventory.ContainsItem(Self.Trident.item) then
+    Exit(EQUIP_TRIDENT);
+
+  if not Inventory.ContainsItem('Drift net') then
+    Exit(CLICK_ANNETTE);
+
+  if Self.CheckNetNotSet() then
+    Exit(SET_NET);
+
+  if Self.CheckNetFull() then
+    Exit(CHECK_NET);
+
+  Exit(CLICK_FISH);
+end;
+
+function TBaseScript.BuildTextReport(): TStringArray override;
+var
+  elapsedTime: UInt64;
+  hunterXP, fishingXP, xpGained: double;
+  huntXP, fishXP, totalXP: double;
+begin
+  if Self.Action = Self.PreviousAction then
+      Exit;
+
+  Self.DebugLn(Self.Action, Self.ExtraInfo);  //add action and extra info the the log.
+  elapsedTime := Self.TimeRunning.ElapsedTime();
+
+  if FishLvl >= 70 then
+    fishXP := 77
+  else
+    fishXP := FishLvl * 1.1;
+
+  if HuntLvl >= 70 then
+    huntXP := 101.5
+  else
+    huntXP := HuntLvl * 1.13;
+
+  TotalXP := huntXP + fishXP;
+
+  xpGained := XPbar.Read - WL.xp.Start;
+  hunterXP := xpGained * (huntXP / TotalXP);
+  fishingXP := xpGained * (fishXP / TotalXP);
+
+  Result += ' Action        : ' + Self.Action;
+
+  Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Trim();
+
+  Result += ' Nets Fished   : ' + ToStr(Self.TotalActions);
+  if Self.ActionLimit > -1 then
+    Result[High(Result)] += '/' + ToStr(Self.ActionLimit);
+
+  Result += ' Nets/Hour     : ' + ToStr(NumberPerHour(Self.TotalActions, elapsedTime));
+
+  Result += ' Fishing Exp   : ' + SRL.FormatNumber(fishingXP, 2);
+
+  Result += ' Exp/Hour      : ' + SRL.FormatNumber(NumberPerHour(fishingXP, elapsedTime), 2);
+
+  Result += ' Hunter Exp    : ' + SRL.FormatNumber(hunterXP, 2);
+  Result += ' Exp/Hour      : ' + SRL.FormatNumber(NumberPerHour(hunterXP, elapsedTime), 2);
+
+  Result += ' Total Exp     : ' + SRL.FormatNumber(xpGained, 2);
+  Result += ' Exp/Hour      : ' + SRL.FormatNumber(NumberPerHour(xpGained, elapsedTime), 2);
+
+  Result += ' Total Profit  : ' + SRL.FormatNumber(Self.TotalProfit, 2);
+  Result += ' Profit/Hour   : ' + SRL.FormatNumber(NumberPerHour(Self.TotalProfit, elapsedTime), 2);
+
+  Result += ' ' + Self.Welcome + ' waspscripts.com';
+end;
+
+procedure TRSProgressReport.DrawProgress(fontColor: Int32);  override;
+var
+  p, q: TPoint;
+  i: Int32;
+begin
+  p := [Self.TopLeft.X + 10, Self.TopLeft.Y + 40];
+  if WLSettings.RemoteInput.HUDTransparent then
+    p.Y -= 12;
+  q := [Round(Chat.Bounds().Width()/2) + 20, p.Y];
+
+  fontColor -= $C8D100;
+
+  for i := 0 to High(ProgressArray) - 1 do
+  begin
+    if Frac(i/2) = 0 then
+    begin
+      ClientImg.DrawTextShadow(ProgressArray[i], p, fontColor, WLSettings.RemoteInput.HUDTransparent);
+      p.Y += 17;
+    end
+    else
+    begin
+      ClientImg.DrawTextShadow(ProgressArray[i], q, fontColor, WLSettings.RemoteInput.HUDTransparent);
+      q.Y += 17;
+    end;
+  end;
+
+  if WLSettings.RemoteInput.HUDTransparent then
+    Self.ClientImg.DrawBoxFilled(Self.UsernameBox, False, $819DAC);
+end;
+
+procedure TMouse.Click(Button: Int32); override;
+{$IFDEF SRL_DEBUG_MOUSE}
+var w,h: Int32; p: TPoint;
+{$ENDIF}
+begin
+  Self.Hold(Button);
+  Wait(SRL.TruncatedGauss(30, 150));
+  Self.Release(Button);
+
+  {$IFDEF SRL_DEBUG_MOUSE}
+  GetClientDimensions(W,H);
+  if Length(Self.DebugClicks) = 0 then
+    Self.DebugClicks.SetSize(W,H);
+
+  p := Self.Position();
+  if InRange(p.x,0,W-1) and InRange(p.y,0,H-1) then // just make sure the mouse is actually within the client bounds
+    Self.DebugClicks[p.y,p.x] += 1;
+  {$ENDIF}
+end;
+
+function ToStr(state: EState): String; overload;
+begin
+  case state of
+    CLICK_FISH: Exit('Chasing fish shoal');
+    CHECK_NET: Exit('Harvesting net');
+    SET_NET: Exit('Placing net');
+    CLOSE_INTERFACE: Exit('Closing interface');
+    CLICK_ANNETTE: Exit('Clicking Annette');
+    DEPOSIT_NETS_ANNETTE: Exit('Depositing nets');
+    WITHDRAW_ALL_ANNETTE: Exit('Withdrawing all nets');
+    WITHDRAW_FIVE_ANNETTE: Exit('Withdrawing five nets');
+    DRINK_STAMINA: Exit('Drink Stamina');
+    ENTER_ENTRYWAY: Exit('Enter entrance');
+    ENTER_ARENA: Exit('Enter fish arena');
+    EQUIP_TRIDENT: Exit('Equiping trident');
+    UNEQUIP_TRIDENT: Exit('Unequiping trident');
+    ENABLE_RUN: Exit('Enable run');
+    CLICK_TUNNEL: Exit('Going through tunnel');
+    OPEN_COLLECT: Exit('Open collect box');
+    OPEN_BANK: Exit('Openning bank');
+    EState.DIVE: Exit('Diving underwater');
+    WITHDRAW_STAMINA: Exit('Withdraw potions');
+    COLLECT_NETS: Exit('Collecting nets');
+    CLICK_ANCHOR: Exit('Going to surface');
+    BANK_CATCH: Exit('Banking fish');
+    HANDLE_CHAT: Exit('Entering instance');
+    end;
+  Exit('undef');
+end;
+
+procedure ReldsDriftNetFisher.Run(maxActions: Int32; maxTime: Int64);
+begin
+  Self.Init(maxActions, maxTime);
+
+  repeat
+    Self.State := Self.GetState();
+    Self.SetAction(ToStr(Self.State));
+    case Self.State of
+      CLICK_FISH: Self.ClickFish();
+      CHECK_NET: Self.CheckNet();
+      SET_NET: Self.SetNet();
+      CLOSE_INTERFACE: Self.CloseInterface();
+      CLICK_ANNETTE: Self.ClickAnnette();
+      DEPOSIT_NETS_ANNETTE: Self.DepositAllNetsAnnette();
+      WITHDRAW_ALL_ANNETTE: Self.WithdrawAllNetsAnnette();
+      WITHDRAW_FIVE_ANNETTE: Self.WithdrawFiveNetsAnnette();
+      DRINK_STAMINA: Self.DrinkStamina();
+      ENTER_ENTRYWAY: Self.EnterEntryway();
+      ENTER_ARENA: Self.EnterArena();
+      EQUIP_TRIDENT: Self.WieldTrident();
+      ENABLE_RUN: Minimap.EnableRun();
+      CLICK_TUNNEL: Self.ClickTunnel();
+      UNEQUIP_TRIDENT: Self.UnEquipTrident();
+      OPEN_COLLECT: Self.OpenCollectBox();
+      OPEN_BANK: Self.OpenBank();
+      EState.DIVE: Self.Dive();
+      WITHDRAW_STAMINA: Self.DoWithdraw();
+      COLLECT_NETS: Self.DoCollect();
+      CLICK_ANCHOR: Self.ClickAnchor();
+      BANK_CATCH: Self.BankCatch();
+      HANDLE_CHAT: Self.HandleChatOptions();
+    end;
+
+  until Self.ShouldStop();
+end;
+
+var
+  Script: ReldsDriftNetFisher;
+
+{$IFDEF SCRIPT_GUI}
+type
+  TConfig = record(TScriptForm)
+    Selector, TridentSelector, PotSelector, NetAmountSelector: TLabeledCombobox;
+
+    CollectBoxCheckBox ,BankCatchCheckBox: TLabeledCheckBox;
+  end;
+
+procedure TConfig.StartScript(sender: TObject); override;
+begin
+  WEAPON := TridentType(Self.TridentSelector.GetItemIndex());
+  POTION := PotionType(Self.PotSelector.GetItemIndex());
+  NETAMOUNT := NetCount(Self.NetAmountSelector.GetItemIndex());
+  ENABLEBANKCATCH := Self.BankCatchCheckBox.IsChecked();
+  CHECKCOLLECT := Self.CollectBoxCheckBox.IsChecked();
+
+  inherited;
+end;
+
+procedure TConfig.Run(); override;
+var
+  tab: TTabSheet;
+begin
+  Self.Setup("Relds Drift Net Fisher");
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  Self.CreateAccountManager(tab);
+
+  Self.CreateVersionPanel(tab);
+
+  Self.CreateAntibanManager();
+  Self.CreateWaspLibSettings();
+  Self.CreateAPISettings();
+
+  with Self.TridentSelector do
+  begin
+    Create(tab);
+    SetCaption('Trident:');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(135));
+    SetStyle(csDropDownList);
+    AddItemArray(['Merfolk Trident', 'Trident of the Seas', 'Trident of the Swamp', 'Dragon Harpoon', 'None']);
+    SetItemIndex(Ord(WEAPON));
+  end;
+
+  with Self.PotSelector do
+  begin
+    Create(tab);
+    SetCaption("Energy Restore:");
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(Self.TridentSelector.GetTop() + TControl.AdjustToDPI(40));
+    SetStyle(csDropDownList);
+    AddItemArray(['Stamina potion(4)', 'Super energy(4)', 'None']);
+    SetItemIndex(Ord(POTION));
+  end;
+
+  with Self.NetAmountSelector do
+  begin
+    Create(tab);
+    SetCaption("Nets to Carry:");
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(Self.PotSelector.GetTop() + TControl.AdjustToDPI(40));
+    SetStyle(csDropDownList);
+    AddItemArray(['5', '10', 'all']);
+    SetItemIndex(Ord(NETAMOUNT));
+  end;
+
+  with Self.BankCatchCheckBox do
+  begin
+    Create(tab);
+    SetCaption("Bank Fish (requires 5 Numulite per drift net)");
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(Self.NetAmountSelector.GetTop() + TControl.AdjustToDPI(50));
+    SetChecked(ENABLEBANKCATCH);
+  end;
+
+  with Self.CollectBoxCheckBox do
+  begin
+    Create(tab);
+    SetCaption("Check collect box for more nets");
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(Self.BankCatchCheckBox.GetTop() + TControl.AdjustToDPI(20));
+    SetChecked(CHECKCOLLECT);
+  end;
+
+  inherited;
+end;
+
+var
+  Config: TConfig;
+{$ENDIF}
+
+begin
+  {$IFDEF SCRIPT_GUI}
+  Sync(@Config.Run);
+  {$ENDIF}
+  Script.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.
+
+
