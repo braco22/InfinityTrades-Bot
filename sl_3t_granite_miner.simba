@@ -1,0 +1,1072 @@
+{$UNDEF SCRIPT_REVISION}{$DEFINE SCRIPT_REVISION := '1'}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}      
+{$include_once accurate_compass.simba}   
+{$include_once world_hopping.simba}
+
+const
+  PNAME: String := '';
+  PPASS: String := '';
+
+  // Drop granite between each rock you mine, as opposed to dropping an
+  // entire inventory at a time
+  DROP_WHILE_MINING := True;
+
+  // If you have a spec pickaxe, you should enable this to use the spec.
+  USE_SPEC := False;
+
+  // Whether to take breaks
+  TAKE_BREAKS: Boolean := True;
+  // Take a break after how many minutes of running?
+  BREAK_AFTER: String := '35';
+  // Take a break for how long, in minutes?
+  BREAK_FOR: String := '6';
+
+  // A percent between 0 and 100. After each rock mined, we have a chance of
+  // afking for a short time between MINI_AFK_MIN_DURATION_MS and
+  // MINI_AFK_MAX_DURATION_MS (these are in milliseconds). A chance of 0 means
+  // we never afk. A chance of 100 means we will afk after every single mine
+  // attempt.
+  MINI_AFK_CHANCE: Double := 1.131;
+  MINI_AFK_MIN_DURATION_MS: Integer := 1300;
+  MINI_AFK_MAX_DURATION_MS: Integer := 4300;
+
+  // If any players are around, hop worlds
+  HOP_IF_PLAYER_IN_QUARRY := False;
+  // If any players are next to you for a few seconds, hop worlds. Does
+  // nothing extra if HOP_IF_PLAYER_IN_QUARRY is True
+  HOP_IF_PLAYER_CRASHING := True;
+
+  // Worlds to hop to, all US worlds. You should change this to only
+  // worlds you have a low ping in.
+  WORLD_LIST: TIntegerArray = [
+    313..315,329..332,337..339,346..348,354..357,362,374,
+    377,378,386,421,422,443..446,477..482,484..496
+  ];
+
+type TGraniteMiner = record
+  RSW: TRSWalker;
+  KnifeSlot: Integer;
+  LogSlots: TIntegerArray;
+  LogIndex: Integer;
+  GraniteRocks: TRSObjectArray;
+  StartXP: Integer;
+  Runtime: TStopwatch;
+  MiningTimer: TStopwatch;
+  Worlds: TIntegerArray;
+  AlreadyHoppedWorlds: Boolean;
+  ClosePlayerCount: Integer;
+end;
+
+const                                   
+  VERSION := 'Rev ' + {$MACRO SCRIPT_REVISION};
+  SYNC_INTERVAL: Integer := 5;
+  MAX_PING: Integer := 40;
+  XpDropBox: TBox := [503, 153, 512, 168];
+  UpTextBox: TBox = [43, 7, 100, 20];
+
+function StringArrayToRSItemArray(itemNames: TStringArray): TRSItemArray;
+var i: Integer;
+begin
+  for i := 0 to High(itemNames) do
+    Result += [itemNames[i]];
+end;
+
+var
+  GraniteMiner: TGraniteMiner;
+
+  RockCoords: T2DPointArray = [
+    [[8054, 4816]],
+    [[8054, 4811]],
+    [[8054, 4807]],
+    [[8061, 4803]]
+  ];
+
+  RockBoxes: TBoxArray := [
+    [344, 250, 405, 320],
+    [341, 270, 405, 333],
+    [122, 278, 236, 333],
+    [405, 11, 483, 45]
+  ];
+
+  RockOffsets: TPointArray := [
+    [0, -10],
+    [0, -10],
+    [8, 0],
+    [-8, 16]
+  ];
+
+  ItemsToDropNames: TStringArray := [
+    'Granite (500g)',
+    'Granite (2kg)',
+    'Granite (5kg)',
+    'Clue geode (beginner)',
+    'Clue geode (easy)'
+  ];  
+  ItemsToDrop: TRSItemArray := StringArrayToRSItemArray(ItemsToDropNames);
+
+  SyncThread: TMMLTimer;
+  LastTickMs: Integer;
+  LagSpike: Boolean;
+
+// ---- Tick syncing logic ----
+
+{$IFDEF WINDOWS}
+function TimeGetTime(): Integer;
+var
+  frequency,counter: ^UInt64;
+  function QPF(F: ^UInt64): LongBool; static; external 'QueryPerformanceFrequency@Kernel32.dll '+{$IFDEF CPU386}'stdcall'{$ELSE}'win64'{$ENDIF};
+  function QPC(C: ^UInt64): LongBool; static; external 'QueryPerformanceCounter@Kernel32.dll '+{$IFDEF CPU386}'stdcall'{$ELSE}'win64'{$ENDIF};
+begin
+  frequency := GetMem(SizeOf(UInt64)); // at least qword aligned
+  counter   := GetMem(SizeOf(UInt64)); // ...
+
+  if QPF(frequency) and QPC(counter) then
+    Result := Trunc(counter^ / frequency^ * 1000)
+  else
+    Result := GetTickCount();
+
+  FreeMem(frequency);
+  FreeMem(counter);
+end;
+{$ELSE}
+function TimeGetTime(): Double;
+begin
+  Result := GetTickCount();
+end;
+{$ENDIF}
+
+procedure SyncTicks(obj: TOBject);
+var
+  tickMs: Integer;
+  tpa: TPointArray;
+  foundColor: Boolean;
+  delta: Integer;
+  tempLastTickMs: Integer;
+  o: TObject;
+begin
+  tempLastTickMs := LastTickMs;
+  tickMs := TimeGetTime();
+  if tickMs < (tempLastTickMs + (1200 - MAX_PING * 2)) then
+    Exit;
+  foundColor := System.FindColorsTolerance(
+    tpa,
+    $FFFFFF,
+    XpDropBox.x1,
+    XpDropBox.y1,
+    XpDropBox.x2,
+    XpDropBox.y2,
+    0
+  );
+  if foundColor then
+  begin
+    GraniteMiner.MiningTimer.Reset();
+    tickMs := TimeGetTime();
+    delta := (tickMs - tempLastTickMs) mod 600;
+    if (tempLastTickMs <> 0) and (Min(delta, 600 - delta) > (MAX_PING * 3 div 2)) then
+      WriteLn('WARNING: Lag spike of ' + ToStr(Min(delta, 600 - delta)) + 'ms (tick ms ' + ToStr(delta) + ')');
+    if (tempLastTickMs <> 0) then
+    begin
+      if (delta > 300) then
+        LastTickMs := tickMs + Max(MAX_PING + Random(-5, 5), 600 - delta - MAX_PING)
+      else
+        LastTickMs := tickMs - delta div 4
+    end
+    else
+    begin
+      LastTickMs := tickMs;
+    end;
+  end;
+
+  o := obj;
+end;
+
+function WaitUntilAtTickStart(numTicks: Integer = 1): Integer;
+var     
+  tempLastTickMs: Integer;
+  currentMs: Integer;
+  deltaMs: Integer;
+  currentTickElapsedMs: Integer;
+  nextTickStartMs: Integer;
+  wakeupTimeMs: Integer;
+
+  WAIT_MS: Integer = 5;
+begin
+  tempLastTickMs := LastTickMs;
+  currentMs := TimeGetTime();
+  deltaMs := currentMs - tempLastTickMs;
+  currentTickElapsedMs := deltaMs mod 600;
+  nextTickStartMs := 600 - currentTickElapsedMs;
+
+  if LagSpike then
+  begin
+    LagSpike := False;
+    numTicks += 1;
+  end;
+
+  wakeupTimeMs := currentMs + nextTickStartMs + (numTicks - 1) * 600;
+  while TimeGetTime() < wakeupTimeMs do
+  begin
+    Wait(WAIT_MS);
+    if tempLastTickMs <> LastTickMs then
+    begin
+      //WriteLn ('Exiting tick wait early');
+      Exit(LastTickMs);
+    end;
+  end;
+
+  Exit(TimeGetTime());
+end;
+
+// ---- Util ----
+
+function Subtract(First: TIntegerArray; Other: TIntegerArray): TIntegerArray;
+var
+  i: Int64;
+begin
+  for i in First do
+    if Other.Find(i) = -1 then
+      Result += i;
+
+  Result.ClearDuplicates();
+  Result.Sort();
+end;
+
+function IsObjectUpText(): Boolean;
+var tpa: TPointArray;
+begin
+  Result := System.FindColorsTolerance(
+    tpa,
+    $D5E111,
+    UpTextBox.x1,
+    UpTextBox.y1,
+    UpTextBox.x2,
+    UpTextBox.y2,
+    30
+  );
+end;
+
+function TRSMainScreen.FindClick(Area: TBox): ERSClickType; override;
+var
+  X, Y: Int32;
+  Bitmap: Int32;
+begin
+  Area.LimitTo(Self.Bounds);
+  Result := ERSClickType.None;
+
+  for Bitmap in Self.RedClicks do
+    if FindBitmapToleranceIn(Bitmap, X, Y, Area, 5) then
+      Exit(ERSClickType.RED);
+
+  for Bitmap in Self.YellowClicks do
+    if FindBitmapToleranceIn(Bitmap, X, Y, Area, 5) then
+      Exit(ERSClickType.YELLOW);
+end;
+
+procedure TMouse.CorrectingMove(Box: TBox; ForcedMove: Boolean = False; Distribution: EMouseDistribution = MOUSE_DISTRIBUTION_DEFAULT); overload;
+var
+  CustomMouse: TMouse;
+  LargerBox: TBox;
+  Width, Height: Integer;
+begin
+  Width := Box.Width();
+  Height := Box.Height();
+  LargerBox := TBox([
+    Box.X1 - Width div 2,
+    Box.Y1,
+    Box.X2 - Width div 2,
+    Box.Y2
+  ]).Expand(Width, Height * 3 div 4);
+
+  Self.Move(LargerBox, ForcedMove, Distribution);
+  if not Box.Contains(Self.Position()) then
+  begin
+    Wait(0, 120, wdLeft);
+    CustomMouse := Self;
+    CustomMouse.Speed := Self.Speed div 2;
+    CustomMouse.Wind := 4;
+    CustomMouse.Gravity := 20;
+    CustomMouse.Move(Box, False, Distribution);
+  end;
+end;
+
+function TRSInventory.ShiftDropSafe(Slots: TIntegerArray; Items: TStringArray): Boolean; overload;
+var
+  Boxes: TBoxArray;
+  I, Attempts: Int32;
+  Selected: Int32;
+begin
+  if (Length(Slots) = 0) then
+    Exit(True);
+
+  IsKeyDown(VK_SHIFT); // Clear cache
+
+  Boxes := Self.GetSlotBoxes();
+
+  try
+    for Attempts := 1 to 5 do
+    begin
+      I := 0;
+
+      while (I < Length(Slots)) do
+      begin
+        Selected := Self.GetSelectedSlot();
+        if (Selected > -1) then
+        begin
+          Self.SetSelectedSlot(-1);
+
+          Break;
+        end;
+
+        if Self.IsSlotUsed(Slots[I]) then
+        begin       
+          if not IsKeyDown(VK_SHIFT) then
+          begin
+            KeyDown(VK_SHIFT);
+            Wait(25, 60, wdLeft); //Wait for SHIFT to be registered before the click (important).
+          end;
+
+          Mouse.CorrectingMove(Boxes[Slots[I]]);
+          Wait(40, 80, wdLeft);
+          if not MainScreen.IsUpText(Items) then
+          begin
+            WriteLn ToStr(MainScreen.GetUpText()) + ' ' + ToStr(Items);
+            Exit;
+          end;
+
+          Mouse.Click(MOUSE_LEFT, False);
+
+          Wait(40, 80, wdLeft);
+        end;
+
+        Inc(I);
+      end;
+
+      if (I = Length(Slots)) then
+        Exit;
+    end;
+  finally
+    KeyUp(VK_SHIFT);
+  end;
+
+  Result := Attempts <= 5;
+end;
+
+function TMouse.Click(Button: Int32; CheckClickType: Boolean): ERSClickType; overload;
+{$IFDEF SRL_DEBUG_MOUSE}
+var w, h: Int32; p: TPoint;
+{$ENDIF}
+var
+  targetMs, waitMs: Integer;
+  mouseBox: TBox;
+begin
+  Result := ERSClickType.NONE;
+  Self.Hold(Button);
+  waitMs := SRL.TruncatedGauss(30, 120);
+  if not CheckClickType then
+    Wait(waitMs)
+  else
+  begin
+    mouseBox := Box(Self.Position(), 10, 10);
+    targetMs := TimeGetTime() + waitMs;
+    while TimeGetTime() < targetMs do
+    begin
+      Wait(5);
+      if Result <> ERSClickType.None then
+        Result := MainScreen.FindClick(mouseBox);
+    end;
+  end;
+  Self.Release(Button);
+
+  {$IFDEF SRL_DEBUG_MOUSE}
+  GetClientDimensions(W,H);
+  if Length(Self.DebugClicks) = 0 then
+    Self.DebugClicks.SetSize(W,H);
+
+  p := Self.Position();
+  if InRange(p.x,0,W-1) and InRange(p.y,0,H-1) then // just make sure the mouse is actually within the client bounds
+    Self.DebugClicks[p.y,p.x] += 1;
+  {$ENDIF}
+end;
+
+function TMouse.ClickAndWaitForRed(): Boolean;
+var
+  clickType: ERSClickType;
+  mouseBox: TBox;
+  endMs: Integer;
+begin
+  mouseBox := Box(Self.Position(), 10, 10);
+
+  case Self.Click(MOUSE_LEFT, True) of
+    ERSClickType.RED:
+      Exit(True);
+    ERSClickType.YELLOW:
+      Exit(False);
+  end;
+
+  endMs := TimeGetTime() + SRL.TruncatedGauss(120, 160);
+  while TimeGetTime() < endMs do
+  begin
+    Wait(5);
+    if (clickType := MainScreen.FindClick(mouseBox)) <> ERSClickType.NONE then
+      break;
+  end;
+
+  if clickType = ERSClickType.RED then
+    Exit(True);
+end;
+
+function TRSInventory.FindItems(Items: TRSItemArray; out Slot: Integer): Boolean; overload;
+var
+  Item: TRSItem;
+  i: Int32;
+  TBA: TBoxArray;
+begin
+  if not Self.Open() then
+    Exit(False);
+
+  TBA := Self.GetSlotBoxes();
+  for i := 0 to High(TBA) do
+    if Self.IsSlotUsed(TBA[i]) then
+      for Item in Items do
+      begin
+        if Length(ItemFinder.Find(Item, [TBA[i]], 1)) > 0 then
+        begin
+          Slot := i;
+          Exit(True);
+        end;
+      end;
+end;
+
+function String.Replicate(Count: Integer): String;
+var i: SizeInt;
+begin
+ Result:='';
+ for i := 1 to Count do
+   Result := Result + Self;
+end;
+
+function ProgReport(
+                           ResultType:int32; ScriptName, ScriptAuthor, ScriptVersion: String;
+                           VarNames: TStringArray;
+                           VarValues: TVariantArray
+                          ): Variant;
+var
+  TSA        : TStringArray;
+  s,s2       : String;
+  s3         : String := '=';
+  s4         : String := ' ';
+  i, i2, L   : Int32;
+begin
+  if (ResultType = 2) then
+    Result := '';
+
+  if length(VarNames) <> Length(VarValues) then
+  begin
+    Writeln('VarNames and VarValues must be the same length');
+    exit;
+  end;
+  SetLength(TSA, 3 + Length(VarNames) + 2);
+  s2 := 'by '+ScriptAuthor;
+
+  TSA[0] := s3;
+  TSA[1] := ScriptName.Capitalize+' '+ScriptVersion;
+  TSA[2] := s2;
+  TSA[3] := s3;
+
+  i2 := 3 + Length(VarNames);
+
+  for i:= 4 to i2 do
+    L := Max(L, Length(VarNames[i-4]));
+
+  for i:= 4 to i2 do
+  begin
+    s := VarValues[i-4];
+    TSA[i] := Padr((VarNames[i-4]).Capitalize, L)+' : '+ s.Capitalize;
+  end;
+
+  TSA[i2+1] := s3;
+
+  i2 := 0;
+  for i:= 0 to High(TSA) do
+    i2 := Max(i2, Length(TSA[i]));
+
+  TSA[0]           := s3.Replicate(i2);
+  TSA[3]           := s3.Replicate(i2);
+  TSA[High(TSA)]   := s3.Replicate(i2);
+
+  TSA[2] := s4.Replicate(round((i2 - Length(TSA[2]))/2)) + TSA[2]; //centering by ScriptAuthor
+
+  for i:= 0 to High(TSA) do
+    if (TSA[i][1] = s3) then
+      case ResultType of
+        0 : writeln     ('[='+Padr(TSA[i], i2)+'=]');
+        1 : writeln     ('[='+Padr(TSA[i], i2)+'=]');
+        2 : Result := Result + '[='+Padr(TSA[i], i2)+'=]' + chr(13);
+        else begin Writeln('Invalid Result Type'); exit; end;
+      end
+    else
+      case ResultType of
+        0 : writeln     ('[ '+Padr(TSA[i], i2)+' ]');
+        1 : writeln     ('[ '+Padr(TSA[i], i2)+' ]');
+        2 : Result := Result + '[ '+Padr(TSA[i], i2)+' ]' + chr(13);
+        else begin Writeln('Invalid Result Type'); exit; end;
+      end;
+
+  if not ResultType = 2 then Result := true;
+end;
+
+procedure TGraniteMiner.Report();
+var
+  xp: Int32 := XPBar.Read() - Self.StartXP;
+  runtime: Int64 := Self.Runtime.ElapsedTime();
+begin
+  if (Self.StartXP <= 0) and (xp > 0) then
+    Self.StartXP := xp;
+
+  ProgReport(
+    1, 'SL 3t Granite Miner', 'superLean', VERSION,
+    ['Runtime', 'XP gained'],
+    [
+      SRL.MsToTime(GetTimeRunning(), Time_Short),
+      ToStr(xp, '(', Round(xp / (runtime / 1000 / 60 / 60)), ' / hr)')
+    ]
+  );
+end;
+
+procedure TMouse.RandomMovement();
+var
+  S: Int32;
+begin
+  S := Self.Speed;
+  Self.Speed := 4;
+  Self.Move(Box(Mouse.Position(), 75, 75), True, );
+  Self.Speed := S;
+end;
+
+procedure BreakPause(Task: PBreakTask);
+var t: PBreakTask;
+begin
+  GraniteMiner.Runtime.Pause();  
+  GraniteMiner.MiningTimer.Pause();
+  t := Task;
+end;
+
+procedure BreakResume(Task: PBreakTask);   
+var t: PBreakTask;
+begin
+  GraniteMiner.Runtime.Resume();    
+  GraniteMiner.MiningTimer.Resume();  
+  t := Task;
+end;
+
+procedure DoLoseFocus();
+Var T: Int32;
+begin
+  T := SRL.NormalRange(1700,8000);
+  Antiban.DebugLn('Losing focus for '+SRL.MsToTime(T, Time_Short));
+  GraniteMiner.MiningTimer.Pause();
+  Antiban.LoseFocus(T);        
+  GraniteMiner.MiningTimer.Resume();
+end;
+
+procedure TGraniteMiner.SetupAntiban();
+begin
+  Antiban.Skills += ERSSKILL.MINING;
+
+  Antiban.AddTask(ONE_MINUTE*3,  @Mouse.RandomMovement);
+  Antiban.AddTask(ONE_MINUTE*4,  @DoLoseFocus);
+  Antiban.AddTask(ONE_MINUTE*15, @Antiban.HoverSkills);
+
+  Antiban.OnStartBreak  := @BreakPause;
+  Antiban.OnFinishBreak := @BreakResume;
+
+  Antiban.AddBreak(ONE_MINUTE*18, ONE_SECOND*40, 0.2, 0.0);
+
+  if TAKE_BREAKS then
+    Antiban.AddBreak(ONE_MINUTE*StrToInt(BREAK_AFTER),ONE_MINUTE*StrToInt(BREAK_FOR), 0.2, 1.0);
+end;
+
+procedure Free();
+begin
+  RSClient.Image.Clear();
+end;
+
+procedure TGraniteMiner.Init();
+var
+  i: Integer;
+  rock: TRSObject;
+begin
+  RSClient.Image.Clear();
+  AddOnTerminate(@Free);
+
+  Login.AddPlayer(PNAME, PPASS, '', []);
+  if (not RSClient.IsLoggedIn()) then
+    if Login.GetPlayer.Password <> '' then
+      Login.LoginPlayer()
+    else
+    begin
+      Writeln('No player credentials');
+      Exit;
+    end;
+
+  SyncThread.Init();
+  SyncThread.setOnTimer(@SyncTicks);
+  SyncThread.setInterval(SYNC_INTERVAL);
+  SyncThread.On();
+
+  Options.SetZoomLevel(100);
+  Wait(100, 400, wdLeft);
+  MainScreen.SetHighestPitch();
+
+
+  RSW.Setup([RSRegions.BANDIT_CAMP_QUARRY]);
+  Wait(100, 200);
+
+  for i := 0 to High(RockCoords) do
+  begin
+    with rock do
+    begin
+      SetupEx([0.6, 0.4, 3], RockCoords[i]);
+      Setup(['Granite']);
+
+      Finder.Colors += CTS2(3497074, 22, 0.06, 0.28);
+      Finder.Colors += CTS2(3821407, 6, 0.13, 0.25);
+
+      Finder.ClusterDistance := 3;
+      Finder.Grow := 0;
+      Finder.Erode := 0;
+      Filter.UpText := True;
+    end;
+    Self.GraniteRocks += rock;
+  end;
+
+  Mouse.MissChance := 0;
+  Mouse.Speed := Random(23, 26);
+  Mouse.IdleInterval := 0;
+  Mouse.Wind := 2;
+
+  StartXP := XPBar.Read();
+  Self.SetupAntiban();
+  Self.Runtime.Start();
+  Self.MiningTimer.Start();
+
+  // Make sure we aren't holding down shift
+  KeyDown(VK_SHIFT);
+  Wait(120, 240, wdLeft);
+  KeyUp(VK_SHIFT);
+  Wait(40, 80, wdLeft);
+
+  if not Inventory.FindItem('Knife', Self.KnifeSlot) then
+    TerminateScript('Couldn''t find knife');
+  if not Inventory.FindItems(['Teak logs', 'Mahogany logs'], Self.LogSlots) then
+    TerminateScript('Couldn''t find logs');
+end;
+
+
+function TGraniteMiner.ResetCycle(): Integer;
+var
+  i: Integer;
+  atpa: T2DPointArray;
+begin
+  Result := -1;
+
+  for i := 0 to High(GraniteRocks) do
+  begin
+    if Self.GraniteRocks[i].IsVisible() then
+    begin
+      if not Self.GraniteRocks[i].Find(atpa) then
+        continue;
+
+      Mouse.Move(atpa.RandomValue());
+      Wait(SRL.TruncatedGauss(10, 60));
+      if Mouse.ClickAndWaitForRed() then
+        Exit(i);
+
+      Wait(SRL.TruncatedGauss(100, 250));
+    end
+  end;
+end;
+
+function TGraniteMiner.GetTicksToWait(startMs, endMs: Integer; skipWaiting: Boolean): Integer;
+var elapsedMs: Integer;
+begin
+  elapsedMs := endMs - startMs;
+  if skipWaiting or (elapsedMs >= 1200) then
+    Result := 1
+  else if elapsedMs >= 600 then
+    Result := 2
+  else
+    Result := 3;
+  WriteLn ('Elapsed: ' + ToStr(endMs - startMs) + ', ticks to wait: ' + ToStr(Result));
+end;
+
+function TGraniteMiner.FindNextRockFast(out tpa: TPointArray; index: Integer; box: TBox): Boolean;
+var
+  tempTpa: TPointArray;
+  PRIMARY_COL: TCTS2Color := CTS2(4219515, 6, 0.09, 0.15);
+  // This is for the northernmost rock, which overlaps the XP bar
+  SECONDARY_COL: TCTS2Color := CTS2(4085095, 3, 0.18, 0.44);
+  // Gray rock
+  TERTIARY_COL: TCTS2Color := CTS2(3947843, 14, 0.18, 0.29);
+begin
+  if index = 3 then // Next rock is northernmost rock
+  begin
+    if SRL.Dice(70) then
+      Swap(PRIMARY_COL, SECONDARY_COL);
+    if SRL.FindColors(tpa, PRIMARY_COL, box) = 0 then
+      SRL.FindColors(tpa, SECONDARY_COL, box);
+  end
+  else
+    SRL.FindColors(tpa, PRIMARY_COL, box);
+
+  Result := Length(tpa) > 0;
+
+  if not Result then
+  begin
+    SRL.FindColors(tempTpa, TERTIARY_COL, box);
+    if Length(tempTpa) > 0 then
+    begin
+      WriteLn('Found gray rock, waiting 1 tick...');
+      WaitUntilAtTickStart(1);
+    end;
+  end;
+end;
+
+function TGraniteMiner.ClickRock(tpa: TPointArray): Boolean;
+var
+  j: Integer;
+
+  NUM_ROCK_TRIES: Integer = 3;
+begin
+  // Try to click the rock. We may misclick, so we'll try a few times.
+  for j := 1 to NUM_ROCK_TRIES do
+  begin
+    if j > 1 then
+      Wait(SRL.TruncatedGauss(110, 230));
+
+    Mouse.Move(tpa.RandomValue());
+    Wait(30, 50, wdLeft);
+
+    if not IsObjectUpText() then
+      continue;
+
+    if Mouse.ClickAndWaitForRed() then
+      Exit(True);
+  end;
+end;
+
+procedure TGraniteMiner.ClickScreenCenter();
+begin
+  Mouse.Click(MainScreen.Center.Offset(
+    SRL.SkewedRand(-4, -24, 12),
+    SRL.SkewedRand(5, -24, 12)
+  ), MOUSE_LEFT);
+end;
+
+function TGraniteMiner.HopWorlds(): Boolean;
+var
+  world: Integer;
+  worldsToHopTo: TIntegerArray;
+begin
+  if Self.Worlds.Len() >= Length(WORLD_LIST) then // Hopped into every world on our list, so reset local worldlist
+    Self.Worlds := [];
+
+  worldsToHopTo := Subtract(WORLD_LIST, Self.Worlds);
+
+  WriteLn('Hopping worlds');
+  if not AlreadyHoppedWorlds then
+    begin
+    if not Logout.ClickLogout(Random(8, 11)) then
+    begin
+      WriteLn('Failed to logout');
+      Exit(False);
+    end;
+    world := worldsToHopTo[Random(0, High(worldsToHopTo))];
+    Self.Worlds.Append(world);
+    if not Login.SwitchToWorld(world) then
+    begin
+      WriteLn('Failed to select world');
+      Exit(False);
+    end;
+    Wait(600, 1500, wdLeft);
+    Result := Login.LoginPlayer();
+  end
+  else
+    Result := Logout.SwitchWorlds(Self.Worlds, worldsToHopTo);
+
+  Self.AlreadyHoppedWorlds := True;
+end;
+
+function TGraniteMiner.CheckForPlayers(): Boolean;
+var
+  i: Integer;
+  foundClosePlayer: Boolean;
+
+  function getDots(): TPointArray;
+  begin
+    Result := Minimap.GetDots(ERSMinimapDot.PLAYER);
+    if not HOP_IF_PLAYER_IN_QUARRY then
+      FilterPointsDist(Result, 3, 12, Minimap.Center.X, Minimap.Center.Y)
+    else
+      FilterPointsDist(Result, 3, 60, Minimap.Center.X, Minimap.Center.Y);
+  end;
+
+  function checkForDots(interval: Integer; tries: Integer): Boolean;
+  var
+    i: Integer;
+    _dots: TPointArray;
+  begin
+    WriteLn('Checking for nearby players...');
+    for i := 1 to tries do
+    begin
+      _dots := getDots();
+      if Length(_dots) > 0 then
+      begin
+        Result := True;
+        break;
+      end;
+      Wait(interval);
+    end;   
+    WriteLn('Found nearby players?: ' + ToStr(Result));
+  end;
+begin
+  if not (HOP_IF_PLAYER_IN_QUARRY or HOP_IF_PLAYER_CRASHING) then
+    Exit(False);
+
+  if Self.AlreadyHoppedWorlds and not checkForDots(Random(800, 1200), 8) then
+    Exit(False);
+
+  if (Length(getDots()) = 0) and (not Self.AlreadyHoppedWorlds) then
+    Exit(False);
+
+
+  if not (HOP_IF_PLAYER_IN_QUARRY or Self.AlreadyHoppedWorlds) then
+  begin
+    Self.ClosePlayerCount += 1;
+    WriteLn('Player detected directly next to us ' + ToStr(Self.ClosePlayerCount) + ' times in a row.');
+    if Self.ClosePlayerCount <= 8 then
+      Exit(False);
+    WriteLn('Player has been close to us too long!');
+  end;
+
+  if not Self.MiningTimer.IsPaused() then
+    Self.MiningTimer.Pause();
+  Self.ClosePlayerCount := 0;
+  Result := True;
+
+  Writeln('Player(s) detected nearby, hopping worlds...');
+  if (not Self.HopWorlds()) then
+  begin
+    Logout.ClickLogout(Random(8, 11));
+    TerminateScript('Failed to hop worlds');
+  end;  
+  if Self.MiningTimer.IsPaused() then
+    Self.MiningTimer.Resume();
+end;
+
+procedure TGraniteMiner.Run();
+var
+  i, j, iterations: Integer;
+  startMs, endMs: Integer;
+  dropSlot: Integer;
+  origMouseSpeed: Integer;
+  tpa: TPointArray;
+  skipWaiting: Boolean = True;
+  resetCycle: Boolean = True;
+  terminateOnFailure: Boolean;
+  pos: TPoint;
+  afkDuration: Integer;
+begin
+  Self.AlreadyHoppedWorlds := True;
+
+  while True do
+  begin
+    if Self.MiningTimer.ElapsedTime() > (30 * 1000) then
+      TerminateScript('Didn''t mine granite in last 30 seconds, terminating');
+
+    if Self.CheckForPlayers() then
+    begin
+      Wait(1000, 2000, wdLeft);
+      continue;
+    end;
+    Self.AlreadyHoppedWorlds := False;
+
+    if SRL.Dice(MINI_AFK_CHANCE) then
+    begin
+      afkDuration := Random(MINI_AFK_MIN_DURATION_MS, MINI_AFK_MAX_DURATION_MS);
+      WriteLn('Going afk for ' + ToStr(afkDuration) + 'ms');
+      Self.MiningTimer.Pause();
+      Wait(afkDuration);       
+      Self.MiningTimer.Resume();
+    end;
+
+    if USE_SPEC and ((iterations mod 13) = 0) and SRL.Dice(73) then
+    begin
+      if Minimap.IsSpecWeapon and (Minimap.GetSpecLevel = 100) then
+      begin
+        Minimap.EnableSpec(100);
+        Wait(111, 312, wdLeft);
+      end;
+    end;
+
+    if resetCycle then
+    begin
+      pos := Self.RSW.GetMyPos();
+      if not RSW.AtTile([
+        [8057, 4807],
+        [8057, 4811]
+      ], 4) then
+      begin
+        RSMouseZoom.SetZoomLevel(SRL.SkewedRand(25, 20, 40));
+        Wait(100, 200, wdLeft);
+        Self.RSW.WebWalk([8057, 4811], 4);
+        Minimap.waitFlag();
+        RSMouseZoom.MaxZoom(False);
+        Wait(100, 200, wdLeft);
+      end;
+
+      if (i := Self.ResetCycle()) = -1 then
+      begin
+        if terminateOnFailure then
+          TerminateScript('Couldn''t find the granite rocks');
+        terminateOnFailure := True;  
+        Wait(SRL.TruncatedGauss(100, 200));
+        Antiban.RandomRotate();
+        Wait(SRL.TruncatedGauss(50, 100));
+        continue;
+      end
+      else
+      begin
+        startMs := TimeGetTime();
+        terminateOnFailure := resetCycle := False;
+        Wait(SRL.TruncatedGauss(100, 200));
+        Minimap.SetCompassAngle(181, 2);
+      end;
+    end;
+
+    // If we haven't successfully mined granite in a while, then our tick cycle
+    // is probably screwed up. We wait for 4 ticks, or until the next XP drop.
+    if (TimeGetTime() - LastTickMs) > 10200 then
+    begin
+      WriteLn('Waiting for tick cycle.');
+      for j := 0 to 4 do
+      begin
+        if WaitUntilAtTickStart(1) = LastTickMs then
+          break;
+      end;
+    end;
+
+    if Antiban.DoAntiban() then
+    begin
+      if not RSClient.IsLoggedIn() then
+        Login.LoginPlayer();
+      if not Inventory.Open() then
+        TerminateScript('Couldn''t open inventory');
+    end;
+
+    Mouse.CorrectingMove(Inventory.GetSlotBox(Self.KnifeSlot));
+    Wait(10, 30, wdLeft);
+    if not MainScreen.IsUpText('Knife') then
+      TerminateScript('Couldn''t find knife');
+    Mouse.Click(MOUSE_LEFT, False);
+    Wait(40, 60, wdLeft);
+    Mouse.Move(Inventory.GetSlotBox(Self.LogSlots[Self.LogIndex]));
+    if not MainScreen.IsUpText('logs') then
+      TerminateScript('Couldn''t find logs');
+
+    // Generally, we want to wait 3 ticks before trying to mine a rock, but it
+    // may have already been a tick (>600ms) or longer since the last time we
+    // tried to mine a rock, so we'll end up waiting anywhere between 0-3 ticks.
+    endMs := TimeGetTime();
+    startMs := WaitUntilAtTickStart(Self.GetTicksToWait(startMs, endMs, skipWaiting));
+    skipWaiting := False;
+
+    origMouseSpeed := Mouse.Speed;
+    Mouse.Speed := Random(26, 29);
+
+    Wait(SRL.TruncatedGauss(70, 90));
+    Mouse.Click(MOUSE_LEFT, False); // Do the tick manipulation, i.e. click on log
+    Wait(40, 60);
+
+    if not Self.FindNextRockFast(tpa, i, RockBoxes[i]) then
+    begin
+      //Debug(RockBoxes[i]);
+      WriteLn('Couldn''t find next rock');
+      Wait(110, 180, wdLeft);
+      // Cancel fletching by clicking center of screen
+      Self.ClickScreenCenter();
+      Mouse.Speed := origMouseSpeed;
+      resetCycle := True;
+      WaitUntilAtTickStart(1);
+      Wait(50, 240, wdLeft);
+      continue;
+    end;
+
+    if not Self.ClickRock(tpa) then
+    begin
+      WriteLn('Couldn''t click next rock'); 
+      Self.ClickScreenCenter();
+      Mouse.Speed := origMouseSpeed;
+      resetCycle := True;
+      WaitUntilAtTickStart(1);
+      Wait(50, 240, wdLeft);
+      continue;
+    end;
+
+    if DROP_WHILE_MINING and Inventory.FindItems(ItemsToDrop, dropSlot) then
+    begin
+      Inventory.ShiftDropSafe([dropSlot], ItemsToDropNames);
+      Wait(SRL.TruncatedGauss(20, 60));
+
+      if not Self.FindNextRockFast(tpa, i, RockBoxes[i].Offset(RockOffsets[i])) then
+      begin
+        WriteLn('Couldn''t find rock after dropping');
+        //Debug(RockBoxes[i].Offset(RockOffsets[i]));
+        Wait(40, 180);
+        Self.ClickScreenCenter();
+        Mouse.Speed := origMouseSpeed;
+        resetCycle := True;
+        WaitUntilAtTickStart(1);
+        Wait(50, 240, wdLeft);
+        continue;
+      end;
+
+      if not Self.ClickRock(tpa) then
+      begin
+        WriteLn('Couldn''t click rock after dropping');
+        resetCycle := True;
+        Mouse.Speed := origMouseSpeed;
+        WaitUntilAtTickStart(1);
+        Wait(50, 240, wdLeft);
+        continue;
+      end;
+
+      Wait(SRL.TruncatedGauss(20, 100));
+    end;
+
+    Mouse.Speed := origMouseSpeed;
+
+    if (not DROP_WHILE_MINING) and (Inventory.Count() >= 27) then
+    begin
+      if TimeGetTime() - startMs < 600 then
+        WaitUntilAtTickStart(1);
+      if SRL.Dice(60) then
+        WaitUntilAtTickStart(SRL.TruncatedGauss(1, 3));
+      Wait(SRL.TruncatedGauss(100, 340));
+      Inventory.ShiftDrop(ItemsToDrop, DROP_PATTERN_SNAKE);
+      skipWaiting := True;
+    end;
+
+    iterations += 1;
+    if (iterations mod 10) = 0 then
+      Self.Report();
+    i := (i + 1) mod Length(GraniteRocks);
+  end;
+end;
+
+begin
+  GraniteMiner.Init();
+  GraniteMiner.Run();
+end.
+
